@@ -28,7 +28,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     topic = sys.argv[1]
-    print(f"\n🚀 Starting AI Blog Crew for topic: '{topic}'\n")
+    print(f"\n Starting AI Blog Crew for topic: '{topic}'\n")
 
     output = run_crew(topic)
     filepath = save_output(output, topic)
