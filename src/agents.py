@@ -3,13 +3,25 @@ from dotenv import load_dotenv
 from crewai import Agent
 from langchain_openai import ChatOpenAI
 
-load_dotenv()
+# override=True ensures .env values take precedence over any system-level env vars
+# (e.g. a system OPENAI_API_KEY pointing at OpenAI instead of OpenRouter)
+load_dotenv(override=True)
 
-# Explicitly build the LLM connection to OpenRouter
+_api_key  = os.getenv("OPENAI_API_KEY")
+_api_base = os.getenv("OPENAI_API_BASE", "https://openrouter.ai/api/v1")
+_model    = os.getenv("OPENAI_MODEL_NAME", "openai/gpt-3.5-turbo")
+
+if not _api_key:
+    raise EnvironmentError(
+        "OPENAI_API_KEY is not set. Add it to your .env file.\n"
+        "For OpenRouter, the key starts with sk-or-v1-..."
+    )
+
+# Explicitly build the LLM connection to OpenRouter (or any OpenAI-compatible API)
 llm = ChatOpenAI(
-    model="openai/gpt-3.5-turbo",
-    openai_api_key=os.getenv("OPENAI_API_KEY"),
-    openai_api_base="https://openrouter.ai/api/v1",
+    model=_model,
+    openai_api_key=_api_key,
+    openai_api_base=_api_base,
     temperature=0.3,
     max_tokens=2048,
 )
