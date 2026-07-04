@@ -1,0 +1,11 @@
+services:
+  blog-agent:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./voice_profile:/app/voice_profile
+    restart: unless-stopped
