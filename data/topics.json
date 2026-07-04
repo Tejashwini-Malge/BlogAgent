@@ -1,0 +1,39 @@
+{
+  "queue": [
+    {
+      "topic": "How AI agents are changing the way we work in 2026",
+      "tone": "conversational",
+      "length": "medium",
+      "audience": "general",
+      "notes": ""
+    },
+    {
+      "topic": "What I learned building a multi-agent system from scratch",
+      "tone": "conversational",
+      "length": "medium",
+      "audience": "general",
+      "notes": "personal experience, storytelling tone"
+    },
+    {
+      "topic": "RAG explained simply — and why I was already using it without knowing",
+      "tone": "casual",
+      "length": "medium",
+      "audience": "general",
+      "notes": ""
+    },
+    {
+      "topic": "The fear of starting in public — and why you should do it anyway",
+      "tone": "conversational",
+      "length": "medium",
+      "audience": "general",
+      "notes": "personal growth angle, tie to learning in public"
+    },
+    {
+      "topic": "Why consistency matters more than perfection in your AI learning journey",
+      "tone": "conversational",
+      "length": "medium",
+      "audience": "general",
+      "notes": ""
+    }
+  ]
+}

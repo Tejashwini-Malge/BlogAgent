@@ -2,87 +2,136 @@ import sys
 import queue
 from dotenv import load_dotenv
 
-# Windows CP1252 console can't encode all Unicode chars the LLM may produce.
-# Reconfigure stdout/stderr to UTF-8 with a replacement fallback.
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
         try:
             _stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
-from crewai import Crew, Process
-from src.agents import researcher, writer, editor
-from src.tasks import create_tasks
+
+from langchain_core.messages import SystemMessage, HumanMessage
+
+from src.agents import researcher, writer, editor, llm
+from src.tasks import LENGTH_WORDS, TONE_GUIDE
 from src.utils import save_output
+from src.metrics import AGENT_METRICS_FN
+from src.self_critic import self_critique_loop
 
 load_dotenv(override=True)
 
-# Maps agent role -> short key used by the frontend
-AGENT_ROLES = {
-    "Senior Research Analyst": "researcher",
-    "Expert Technical Writer": "writer",
-    "Chief Editor": "editor",
-}
+# ── Prompt templates ──────────────────────────────────────────────────────────
+
+_RESEARCH_PROMPT = """\
+Research the following topic thoroughly: '{topic}'.
+Produce a Markdown brief with:
+- A one-paragraph overview
+- 4-6 key subtopics, each with 2-3 bullet points
+- Any important caveats or misconceptions to address
+"""
+
+_WRITE_PROMPT = """\
+Using the research brief below, write a blog post about: '{topic}'.
+Requirements:
+- Engaging opening hook
+- Clear H2 section headers
+- Practical takeaways or examples
+- Concise conclusion
+{style_block}
+
+--- RESEARCH BRIEF ---
+{research}
+"""
+
+_EDIT_PROMPT = """\
+Review and polish the blog post draft below.
+Focus on:
+- Grammar and punctuation errors
+- Improving the opening hook if it feels weak
+- Ensuring section transitions are smooth
+- Maintaining the required tone and length
+Return the complete, final polished post. Do not shorten it significantly.
+{style_block}
+
+--- DRAFT ---
+{draft}
+"""
 
 
-def _make_step_callback(event_queue: queue.Queue, task_order: list):
-    """Returns a step_callback that pushes SSE-friendly events into event_queue."""
-    step_state = {"task_idx": 0, "last_agent": None}
+def _style_block(tone: str, length: str, audience: str, notes: str) -> str:
+    block = (
+        f"\n\nSTYLE REQUIREMENTS (follow strictly):\n"
+        f"- Tone: {TONE_GUIDE.get(tone, tone)}\n"
+        f"- Target length: {LENGTH_WORDS.get(length, '800–1000 words')}\n"
+        f"- Target audience: {audience} readers\n"
+    )
+    if notes.strip():
+        block += f"- Additional instructions: {notes.strip()}\n"
+    return block
 
-    def step_callback(step_output):
-        output_text = str(step_output)
 
-        # Detect which agent role appears in the output (verbose logs contain it)
-        detected = None
-        for role, key in AGENT_ROLES.items():
-            if role in output_text:
-                detected = key
-                break
+def _emit(eq, event: dict):
+    if eq is not None:
+        eq.put(event)
 
-        if detected and detected != step_state["last_agent"]:
-            step_state["last_agent"] = detected
-            event_queue.put({"type": "agent_active", "agent": detected})
 
-        # Stream a trimmed log line
-        trimmed = output_text.strip()
-        if trimmed:
-            event_queue.put({
-                "type": "log",
-                "agent": detected or step_state["last_agent"],
-                "message": trimmed[:300],
-            })
-
-    return step_callback
-
+# ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def run_crew(
     topic: str,
-    event_queue: queue.Queue | None = None,
+    event_queue: "queue.Queue | None" = None,
     tone: str = "professional",
     length: str = "medium",
     audience: str = "general",
     notes: str = "",
 ) -> str:
-    tasks = create_tasks(topic, tone=tone, length=length, audience=audience, notes=notes)
-    task_order = ["researcher", "writer", "editor"]
+    style = _style_block(tone, length, audience, notes)
+    eq = event_queue
 
-    kwargs = {
-        "agents": [researcher, writer, editor],
-        "tasks": tasks,
-        "process": Process.sequential,
-        "verbose": True,
-    }
+    # Phase 1 — Research
+    _emit(eq, {"type": "agent_active", "agent": "researcher"})
+    _emit(eq, {"type": "log", "agent": "researcher",
+               "message": f"Researching topic: '{topic}'"})
 
-    if event_queue is not None:
-        kwargs["step_callback"] = _make_step_callback(event_queue, task_order)
+    raw = llm.invoke([
+        SystemMessage(content=researcher.backstory),
+        HumanMessage(content=_RESEARCH_PROMPT.format(topic=topic)),
+    ]).content.strip()
 
-    crew = Crew(**kwargs)
+    research_out, _ = self_critique_loop(
+        llm, "researcher", AGENT_METRICS_FN["researcher"], raw, eq,
+    )
 
-    try:
-        result = crew.kickoff()
-        return str(result)
-    except Exception as exc:
-        raise RuntimeError(f"Crew execution failed: {exc}") from exc
+    # Phase 2 — Write
+    _emit(eq, {"type": "agent_active", "agent": "writer"})
+    _emit(eq, {"type": "log", "agent": "writer",
+               "message": "Drafting blog post from research brief…"})
+
+    raw = llm.invoke([
+        SystemMessage(content=writer.backstory),
+        HumanMessage(content=_WRITE_PROMPT.format(
+            topic=topic, style_block=style, research=research_out,
+        )),
+    ]).content.strip()
+
+    write_out, _ = self_critique_loop(
+        llm, "writer", AGENT_METRICS_FN["writer"], raw, eq,
+    )
+
+    # Phase 3 — Edit
+    _emit(eq, {"type": "agent_active", "agent": "editor"})
+    _emit(eq, {"type": "log", "agent": "editor",
+               "message": "Polishing draft for publication…"})
+
+    raw = llm.invoke([
+        SystemMessage(content=editor.backstory),
+        HumanMessage(content=_EDIT_PROMPT.format(style_block=style, draft=write_out)),
+    ]).content.strip()
+
+    final_out, _ = self_critique_loop(
+        llm, "editor", AGENT_METRICS_FN["editor"], raw, eq,
+    )
+
+    return final_out
 
 
 if __name__ == "__main__":
