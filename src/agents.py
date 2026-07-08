@@ -8,10 +8,11 @@ from langchain_openai import ChatOpenAI
 # (e.g. a system OPENAI_API_KEY pointing at OpenAI instead of OpenRouter)
 load_dotenv(override=True)
 
-_api_key        = os.getenv("OPENAI_API_KEY")
-_api_base       = os.getenv("OPENAI_API_BASE", "https://openrouter.ai/api/v1")
-_model          = os.getenv("OPENAI_MODEL_NAME", "openai/gpt-3.5-turbo")
-_fallback_model = os.getenv("OPENAI_FALLBACK_MODEL_NAME", "llama-3.1-8b-instant")
+_api_key        = (os.getenv("OPENAI_API_KEY") or "").strip()
+_api_base       = os.getenv("OPENAI_API_BASE", "https://openrouter.ai/api/v1").strip()
+_model          = os.getenv("OPENAI_MODEL_NAME", "openai/gpt-3.5-turbo").strip()
+_fallback_model = os.getenv("OPENAI_FALLBACK_MODEL_NAME", "llama-3.1-8b-instant").strip()
+_llm_timeout    = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "45"))
 
 if not _api_key:
     raise EnvironmentError(
@@ -19,13 +20,16 @@ if not _api_key:
         "For OpenRouter, the key starts with sk-or-v1-..."
     )
 
-# Explicitly build the LLM connection to OpenRouter (or any OpenAI-compatible API)
+# Explicitly build the LLM connection to OpenRouter (or any OpenAI-compatible API).
+# request_timeout keeps a hung/blackholed connection from stalling a run for
+# the client library's default (10 min) — fail fast so retries/fallback kick in.
 llm = ChatOpenAI(
     model=_model,
     openai_api_key=_api_key,
     openai_api_base=_api_base,
     temperature=0.3,
     max_tokens=2048,
+    request_timeout=_llm_timeout,
 )
 
 _fallback_llm = ChatOpenAI(
@@ -34,6 +38,7 @@ _fallback_llm = ChatOpenAI(
     openai_api_base=_api_base,
     temperature=0.3,
     max_tokens=2048,
+    request_timeout=_llm_timeout,
 ) if _fallback_model else None
 
 
