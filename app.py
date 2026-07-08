@@ -387,4 +387,11 @@ async def root():
     )
 
 
+@app.get("/favicon.ico")
+async def favicon():
+    # No icon asset yet — return 204 instead of letting StaticFiles 404 on every page load.
+    from fastapi.responses import Response
+    return Response(status_code=204)
+
+
 app.mount("/static", NoCacheStaticFiles(directory=str(FRONTEND_DIR)), name="static")
