@@ -119,7 +119,10 @@ async def generate(
             filepath = save_output(result, topic)
             event_q.put({"type": "final", "content": result, "saved_to": filepath})
         except Exception as exc:
-            event_q.put({"type": "error", "message": str(exc)})
+            import traceback
+            print(f"[app] crew_thread failed for topic '{topic}': {exc!r}")
+            traceback.print_exc()
+            event_q.put({"type": "error", "message": str(exc) or repr(exc)})
         finally:
             event_q.put(None)  # sentinel
 

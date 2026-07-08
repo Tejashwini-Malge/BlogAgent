@@ -1,4 +1,5 @@
 import os
+import time
 from dotenv import load_dotenv
 from crewai import Agent
 from langchain_openai import ChatOpenAI
@@ -41,25 +42,60 @@ def _is_rate_limit(exc: Exception) -> bool:
     return "429" in text or "rate_limit" in text
 
 
+def _is_transient_connection_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(s in text for s in (
+        "connection error", "connection reset", "connection aborted",
+        "timeout", "timed out", "temporarily unavailable",
+        "eof occurred", "remote end closed",
+    ))
+
+
+_CONNECTION_RETRIES = 2       # attempts on the SAME model before giving up/falling back
+_CONNECTION_RETRY_DELAY = 2   # seconds between retries
+
+
 class FallbackLLM:
     """
-    Invokes the primary model; on a 429/rate-limit error retries the same
-    call on the fallback model. Groq quotas are per-model, so the fallback
-    keeps runs alive after the primary's daily token budget is exhausted.
+    Invokes the primary model with a couple of retries for transient network
+    blips (Railway's outbound connections to Groq occasionally hiccup), then:
+      - on a 429/rate-limit error, retries the call on the fallback model
+        (Groq quotas are per-model, so the fallback keeps runs alive after
+        the primary's daily token budget is exhausted).
+      - on a persistent connection error, also tries the fallback model once
+        before giving up, in case the issue is model-specific.
     """
 
     def __init__(self, primary, fallback):
         self._primary  = primary
         self._fallback = fallback
 
+    def _invoke_with_retries(self, model, messages, label):
+        last_exc = None
+        for attempt in range(1, _CONNECTION_RETRIES + 1):
+            try:
+                return model.invoke(messages)
+            except Exception as exc:
+                last_exc = exc
+                if not _is_transient_connection_error(exc) or attempt == _CONNECTION_RETRIES:
+                    raise
+                print(f"[agents] {label} connection error (attempt {attempt}/{_CONNECTION_RETRIES}): {exc!r} — retrying")
+                time.sleep(_CONNECTION_RETRY_DELAY)
+        raise last_exc  # unreachable, keeps type-checkers happy
+
     def invoke(self, messages):
         try:
-            return self._primary.invoke(messages)
+            return self._invoke_with_retries(self._primary, messages, _model)
         except Exception as exc:
-            if self._fallback is None or not _is_rate_limit(exc):
+            if self._fallback is None:
                 raise
-            print(f"[agents] {_model} rate-limited; retrying on {_fallback_model}")
-            return self._fallback.invoke(messages)
+            if _is_rate_limit(exc):
+                print(f"[agents] {_model} rate-limited; retrying on {_fallback_model}")
+            elif _is_transient_connection_error(exc):
+                print(f"[agents] {_model} unreachable after retries; trying {_fallback_model}: {exc!r}")
+            else:
+                raise
+            return self._invoke_with_retries(self._fallback, messages, _fallback_model)
 
 
 # Use this for direct .invoke() calls (crew pipeline, self-critique, revisions)
