@@ -11,7 +11,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
-from src.agents import researcher, writer, editor, llm
+from src.agents import researcher, writer, editor, smart_llm as llm
 from src.tasks import LENGTH_WORDS, TONE_GUIDE
 from src.utils import save_output
 from src.metrics import AGENT_METRICS_FN
@@ -83,9 +83,13 @@ def run_crew(
     length: str = "medium",
     audience: str = "general",
     notes: str = "",
+    critique: bool = False,
 ) -> str:
     style = _style_block(tone, length, audience, notes)
     eq = event_queue
+    # critique=False still measures quality metrics (free, local) but skips the
+    # LLM self-revision rounds, which roughly triple token spend per agent.
+    critique_rounds = 2 if critique else 0
 
     # Phase 1 — Research
     _emit(eq, {"type": "agent_active", "agent": "researcher"})
@@ -99,6 +103,7 @@ def run_crew(
 
     research_out, _ = self_critique_loop(
         llm, "researcher", AGENT_METRICS_FN["researcher"], raw, eq,
+        max_iter=critique_rounds,
     )
 
     # Phase 2 — Write
@@ -115,6 +120,7 @@ def run_crew(
 
     write_out, _ = self_critique_loop(
         llm, "writer", AGENT_METRICS_FN["writer"], raw, eq,
+        max_iter=critique_rounds,
     )
 
     # Phase 3 — Edit
@@ -129,6 +135,7 @@ def run_crew(
 
     final_out, _ = self_critique_loop(
         llm, "editor", AGENT_METRICS_FN["editor"], raw, eq,
+        max_iter=critique_rounds,
     )
 
     return final_out
@@ -136,12 +143,13 @@ def run_crew(
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python -m src.crew \"Your topic here\"")
+        print("Usage: python -m src.crew \"Your topic here\" [--critique]")
         sys.exit(1)
 
     topic = sys.argv[1]
+    critique = "--critique" in sys.argv[2:]
     print(f"\nStarting AI Blog Crew for topic: '{topic}'\n")
 
-    output = run_crew(topic)
+    output = run_crew(topic, critique=critique)
     filepath = save_output(output, topic)
     print(f"\n✅ Blog post saved to: {filepath}")

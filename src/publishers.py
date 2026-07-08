@@ -169,9 +169,10 @@ def revise_post(draft: str, corrections: str) -> str:
         print("[publishers] openai package not available — returning original draft.")
         return draft
 
-    api_key  = os.getenv("OPENAI_API_KEY", "")
-    api_base = os.getenv("OPENAI_API_BASE", "https://openrouter.ai/api/v1")
-    model    = os.getenv("OPENAI_MODEL_NAME", "openai/gpt-4o-mini")
+    api_key        = os.getenv("OPENAI_API_KEY", "")
+    api_base       = os.getenv("OPENAI_API_BASE", "https://openrouter.ai/api/v1")
+    model          = os.getenv("OPENAI_MODEL_NAME", "openai/gpt-4o-mini")
+    fallback_model = os.getenv("OPENAI_FALLBACK_MODEL_NAME", "llama-3.1-8b-instant")
 
     if not api_key or _DUMMY in api_key:
         print("[publishers] OpenRouter not configured — returning original draft.")
@@ -196,9 +197,9 @@ def revise_post(draft: str, corrections: str) -> str:
 ORIGINAL DRAFT:
 {draft}"""
 
-    try:
+    def _call(use_model: str) -> str:
         resp = client.chat.completions.create(
-            model=model,
+            model=use_model,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user",   "content": user_msg},
@@ -206,8 +207,19 @@ ORIGINAL DRAFT:
             temperature=0.2,
             max_tokens=3000,
         )
-        revised = resp.choices[0].message.content or ""
-        return revised.strip() if revised.strip() else draft
+        return (resp.choices[0].message.content or "").strip()
+
+    try:
+        revised = _call(model)
+        return revised if revised else draft
     except Exception as exc:
+        # Groq quotas are per-model — a smaller fallback model may still have budget
+        if fallback_model and ("429" in str(exc) or "rate_limit" in str(exc)):
+            print(f"[publishers] {model} rate-limited; retrying on {fallback_model}")
+            try:
+                revised = _call(fallback_model)
+                return revised if revised else draft
+            except Exception as exc2:
+                exc = exc2
         print(f"[publishers] revise_post failed: {exc} — returning original draft.")
         return draft

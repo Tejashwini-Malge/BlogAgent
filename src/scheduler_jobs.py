@@ -14,6 +14,7 @@ Set ENABLE_INTERNAL_SCHEDULER=false in .env once Hermes owns scheduling.
 """
 
 import json
+import os
 import queue
 import threading
 from pathlib import Path
@@ -80,7 +81,9 @@ def draft_job() -> dict | None:
     # Inject voice profile as notes
     notes_with_voice = get_voice_context(notes)
 
-    # Run the crew (no SSE queue for scheduled runs)
+    # Run the crew (no SSE queue for scheduled runs).
+    # Self-critique is opt-in via env — it roughly triples token spend per run.
+    critique = os.getenv("SCHEDULED_SELF_CRITIQUE", "false").strip().lower() == "true"
     try:
         content = run_crew(
             topic,
@@ -89,6 +92,7 @@ def draft_job() -> dict | None:
             length=length,
             audience=audience,
             notes=notes_with_voice,
+            critique=critique,
         )
     except Exception as exc:
         print(f"[scheduler] draft_job: crew failed — {exc}")

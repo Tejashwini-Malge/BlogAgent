@@ -357,7 +357,7 @@ function dismissPersonModal(overlay) {
 }
 
 /* ── Style Settings ─────────────────────────────────────────────────────── */
-const STYLE_DEFAULTS = { tone: 'professional', length: 'medium', audience: 'general', notes: '' };
+const STYLE_DEFAULTS = { tone: 'professional', length: 'medium', audience: 'general', notes: '', critique: 'off' };
 let agentStyle = { ...STYLE_DEFAULTS };
 
 function loadStyle() {
@@ -1076,6 +1076,7 @@ function generate() {
     length:   agentStyle.length,
     audience: agentStyle.audience,
     notes:    agentStyle.notes || '',
+    critique: agentStyle.critique === 'on' ? 'true' : 'false',
   });
 
   activeEs = new EventSource(`/api/generate?${params}`);

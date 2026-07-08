@@ -74,6 +74,7 @@ async def generate(
     length:   str = Query("medium"),
     audience: str = Query("general"),
     notes:    str = Query(""),
+    critique: bool = Query(False),
 ):
     """
     Streams Server-Sent Events while the crew writes the blog post.
@@ -109,6 +110,7 @@ async def generate(
                 topic, event_q,
                 tone=tone, length=length, audience=audience,
                 notes=notes_with_voice,
+                critique=critique,
             )
 
             if cancel_event.is_set():

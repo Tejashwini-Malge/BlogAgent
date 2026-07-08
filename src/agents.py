@@ -7,9 +7,10 @@ from langchain_openai import ChatOpenAI
 # (e.g. a system OPENAI_API_KEY pointing at OpenAI instead of OpenRouter)
 load_dotenv(override=True)
 
-_api_key  = os.getenv("OPENAI_API_KEY")
-_api_base = os.getenv("OPENAI_API_BASE", "https://openrouter.ai/api/v1")
-_model    = os.getenv("OPENAI_MODEL_NAME", "openai/gpt-3.5-turbo")
+_api_key        = os.getenv("OPENAI_API_KEY")
+_api_base       = os.getenv("OPENAI_API_BASE", "https://openrouter.ai/api/v1")
+_model          = os.getenv("OPENAI_MODEL_NAME", "openai/gpt-3.5-turbo")
+_fallback_model = os.getenv("OPENAI_FALLBACK_MODEL_NAME", "llama-3.1-8b-instant")
 
 if not _api_key:
     raise EnvironmentError(
@@ -25,6 +26,44 @@ llm = ChatOpenAI(
     temperature=0.3,
     max_tokens=2048,
 )
+
+_fallback_llm = ChatOpenAI(
+    model=_fallback_model,
+    openai_api_key=_api_key,
+    openai_api_base=_api_base,
+    temperature=0.3,
+    max_tokens=2048,
+) if _fallback_model else None
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    text = str(exc)
+    return "429" in text or "rate_limit" in text
+
+
+class FallbackLLM:
+    """
+    Invokes the primary model; on a 429/rate-limit error retries the same
+    call on the fallback model. Groq quotas are per-model, so the fallback
+    keeps runs alive after the primary's daily token budget is exhausted.
+    """
+
+    def __init__(self, primary, fallback):
+        self._primary  = primary
+        self._fallback = fallback
+
+    def invoke(self, messages):
+        try:
+            return self._primary.invoke(messages)
+        except Exception as exc:
+            if self._fallback is None or not _is_rate_limit(exc):
+                raise
+            print(f"[agents] {_model} rate-limited; retrying on {_fallback_model}")
+            return self._fallback.invoke(messages)
+
+
+# Use this for direct .invoke() calls (crew pipeline, self-critique, revisions)
+smart_llm = FallbackLLM(llm, _fallback_llm)
 
 researcher = Agent(
     role="Senior Research Analyst",
