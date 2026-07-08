@@ -1636,6 +1636,7 @@ body.phase--editing::before {
 .metrics-card__status--running  { background: var(--orange-tint); color: var(--orange-b); }
 .metrics-card__status--improved { background: var(--green-tint);  color: var(--green); }
 .metrics-card__status--skipped  { background: var(--teal-tint);   color: var(--teal); }
+.metrics-card__status--off      { background: rgba(255,255,255,.06); color: var(--text-dim, #7B769A); }
 
 .metrics-card__table {
   width: 100%; border-collapse: collapse;

@@ -104,6 +104,7 @@ let toastTimer    = null;
 let drawerOpen    = false;
 let activeAgent   = null;
 let metricsData   = {}; // { agentName: { iters: [{...},...], skipped: false, skipReason: '' } }
+let requestedCritiqueRounds = 0; // rounds asked for on the run currently displayed
 
 /* ── Metric labels (mirrors src/metrics.py METRIC_LABELS) ──────────────── */
 const METRIC_LABELS_JS = {
@@ -142,8 +143,14 @@ function renderAgentMetrics(agent) {
   const baseline    = d.iters[0];
   const latest      = d.iters[d.iters.length - 1];
   const hasRevision = d.iters.length > 1;
-  const status      = d.skipped ? 'skipped' : hasRevision ? 'improved' : 'running';
-  const statusLabel = d.skipped ? 'no change' : hasRevision ? `+${d.iters.length - 1} rev` : 'measuring…';
+  // No revision yet: either self-review wasn't requested for this run (done,
+  // nothing more coming) or a round is genuinely still in flight.
+  const stillMeasuring = !hasRevision && requestedCritiqueRounds > 0 && !d.skipped;
+  const status      = d.skipped ? 'skipped' : hasRevision ? 'improved' : stillMeasuring ? 'running' : 'off';
+  const statusLabel = d.skipped ? 'no change'
+    : hasRevision ? `+${d.iters.length - 1} rev`
+    : stillMeasuring ? 'measuring…'
+    : 'no self-review';
 
   const keys       = Object.keys(baseline);
   const headerAfter = hasRevision ? '<th>After</th>' : '';
@@ -357,7 +364,7 @@ function dismissPersonModal(overlay) {
 }
 
 /* ── Style Settings ─────────────────────────────────────────────────────── */
-const STYLE_DEFAULTS = { tone: 'professional', length: 'medium', audience: 'general', notes: '', critique: 'off' };
+const STYLE_DEFAULTS = { tone: 'professional', length: 'medium', audience: 'general', notes: '', critiqueRounds: '0' };
 let agentStyle = { ...STYLE_DEFAULTS };
 
 function loadStyle() {
@@ -1063,6 +1070,7 @@ function generate() {
   resetUI();
   isRunning    = true;
   currentTopic = topic;
+  requestedCritiqueRounds = parseInt(agentStyle.critiqueRounds || '0', 10) || 0;
   generateBtn.disabled = true;
   generateBtn.classList.add('is-loading', 'phase--researching');
   btnLabel.textContent = 'Researching…';
@@ -1076,7 +1084,7 @@ function generate() {
     length:   agentStyle.length,
     audience: agentStyle.audience,
     notes:    agentStyle.notes || '',
-    critique: agentStyle.critique === 'on' ? 'true' : 'false',
+    critique_rounds: agentStyle.critiqueRounds || '0',
   });
 
   activeEs = new EventSource(`/api/generate?${params}`);

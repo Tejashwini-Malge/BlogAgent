@@ -83,13 +83,14 @@ def run_crew(
     length: str = "medium",
     audience: str = "general",
     notes: str = "",
-    critique: bool = False,
+    critique_rounds: int = 0,
 ) -> str:
     style = _style_block(tone, length, audience, notes)
     eq = event_queue
-    # critique=False still measures quality metrics (free, local) but skips the
-    # LLM self-revision rounds, which roughly triple token spend per agent.
-    critique_rounds = 2 if critique else 0
+    # critique_rounds=0 still measures quality metrics (free, local) but skips
+    # the LLM self-revision rounds, which roughly triple token spend per agent
+    # per round. Each round adds one more full-output LLM call per agent.
+    critique_rounds = max(0, min(critique_rounds, 2))
 
     # Phase 1 — Research
     _emit(eq, {"type": "agent_active", "agent": "researcher"})
@@ -143,13 +144,16 @@ def run_crew(
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python -m src.crew \"Your topic here\" [--critique]")
+        print("Usage: python -m src.crew \"Your topic here\" [--critique-rounds N]")
         sys.exit(1)
 
     topic = sys.argv[1]
-    critique = "--critique" in sys.argv[2:]
+    critique_rounds = 0
+    if "--critique-rounds" in sys.argv[2:]:
+        idx = sys.argv.index("--critique-rounds")
+        critique_rounds = int(sys.argv[idx + 1])
     print(f"\nStarting AI Blog Crew for topic: '{topic}'\n")
 
-    output = run_crew(topic, critique=critique)
+    output = run_crew(topic, critique_rounds=critique_rounds)
     filepath = save_output(output, topic)
     print(f"\n✅ Blog post saved to: {filepath}")

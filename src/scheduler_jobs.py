@@ -82,8 +82,9 @@ def draft_job() -> dict | None:
     notes_with_voice = get_voice_context(notes)
 
     # Run the crew (no SSE queue for scheduled runs).
-    # Self-critique is opt-in via env — it roughly triples token spend per run.
-    critique = os.getenv("SCHEDULED_SELF_CRITIQUE", "false").strip().lower() == "true"
+    # Self-critique rounds are opt-in via env — each round roughly adds one
+    # more full-output LLM call per agent (0-2).
+    critique_rounds = int(os.getenv("SCHEDULED_SELF_CRITIQUE_ROUNDS", "0"))
     try:
         content = run_crew(
             topic,
@@ -92,7 +93,7 @@ def draft_job() -> dict | None:
             length=length,
             audience=audience,
             notes=notes_with_voice,
-            critique=critique,
+            critique_rounds=critique_rounds,
         )
     except Exception as exc:
         print(f"[scheduler] draft_job: crew failed — {exc}")
