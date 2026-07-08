@@ -12,7 +12,7 @@ _api_key        = (os.getenv("OPENAI_API_KEY") or "").strip()
 _api_base       = os.getenv("OPENAI_API_BASE", "https://openrouter.ai/api/v1").strip()
 _model          = os.getenv("OPENAI_MODEL_NAME", "openai/gpt-3.5-turbo").strip()
 _fallback_model = os.getenv("OPENAI_FALLBACK_MODEL_NAME", "llama-3.1-8b-instant").strip()
-_llm_timeout    = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "45"))
+_llm_timeout    = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "25"))
 
 if not _api_key:
     raise EnvironmentError(
@@ -56,19 +56,22 @@ def _is_transient_connection_error(exc: Exception) -> bool:
     ))
 
 
-_CONNECTION_RETRIES = 2       # attempts on the SAME model before giving up/falling back
-_CONNECTION_RETRY_DELAY = 2   # seconds between retries
+_CONNECTION_RETRIES = 1       # attempts on the SAME model before falling back to the other model
+_CONNECTION_RETRY_DELAY = 1   # seconds between retries
 
 
 class FallbackLLM:
     """
-    Invokes the primary model with a couple of retries for transient network
-    blips (Railway's outbound connections to Groq occasionally hiccup), then:
+    Invokes the primary model (one attempt, bounded by OPENAI_TIMEOUT_SECONDS
+    so a hung connection can't stall the whole run), then:
       - on a 429/rate-limit error, retries the call on the fallback model
         (Groq quotas are per-model, so the fallback keeps runs alive after
         the primary's daily token budget is exhausted).
-      - on a persistent connection error, also tries the fallback model once
-        before giving up, in case the issue is model-specific.
+      - on a connection error, also tries the fallback model once before
+        giving up, in case the issue is model- or endpoint-specific.
+    Worst case per invoke() is ~2x OPENAI_TIMEOUT_SECONDS, not a multiple of
+    retry attempts — kept deliberately low since self-critique rounds chain
+    several invoke() calls back to back.
     """
 
     def __init__(self, primary, fallback):
