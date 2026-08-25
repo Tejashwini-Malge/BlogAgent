@@ -1,5 +1,12 @@
 import re
 
+# Sentence/word splitting lives in craft so the prose detectors and these
+# metrics can never disagree about what a sentence is.
+from src.craft import (
+    _words, _sentences,
+    find_ai_tells, find_cliches, hedge_density, sentence_variance,
+)
+
 TRANSITION_WORDS = {
     "however", "therefore", "furthermore", "moreover", "additionally",
     "consequently", "meanwhile", "nevertheless", "nonetheless", "thus",
@@ -16,14 +23,6 @@ _HOOK_WORDS = {
     "imagine", "discover", "secret", "reveal", "surprising", "shocking",
     "truth", "myth", "mistake", "transform", "unlock", "master", "hidden",
 }
-
-
-def _words(text):
-    return [w for w in re.split(r'\s+', text.strip()) if w]
-
-
-def _sentences(text):
-    return [p for p in re.split(r'(?<=[.!?])\s+', text.strip()) if len(p.strip()) > 3]
 
 
 def research_metrics(text: str) -> dict:
@@ -61,6 +60,14 @@ def writing_metrics(text: str) -> dict:
         "h2_count":         h2_count,
         "avg_sentence_len": avg_sent,
         "hook_score":       hook_score,
+        # Craft signals. These feed the self-critique prompt, so a revision
+        # round can target stale phrasing and monotone rhythm instead of only
+        # structural counts. Clean drafts score 0 here and are skipped by
+        # _mean_delta entirely, so they don't dilute the improvement gate.
+        "ai_tell_count":    len(find_ai_tells(text)),
+        "cliche_count":     len(find_cliches(text)),
+        "hedge_per_100w":   hedge_density(text),
+        "sentence_var":     sentence_variance(text),
     }
 
 
@@ -92,4 +99,8 @@ METRIC_LABELS = {
     "hook_score":       "Hook strength",
     "transition_count": "Transitions",
     "passive_count":    "Passive voice",
+    "ai_tell_count":    "Stock phrases",
+    "cliche_count":     "Cliches",
+    "hedge_per_100w":   "Hedges /100w",
+    "sentence_var":     "Sentence variety",
 }

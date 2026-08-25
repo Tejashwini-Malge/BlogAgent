@@ -17,6 +17,7 @@ import json
 import os
 import queue
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -34,6 +35,10 @@ from src.utils import save_output
 
 _TOPICS_FILE = Path(__file__).parent.parent / "data" / "topics.json"
 _topics_lock = threading.Lock()
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ── topic queue ───────────────────────────────────────────────────────────────
@@ -145,23 +150,37 @@ def publish_job() -> dict:
         li_result = publishers.publish_linkedin(li_text)
         li_url = li_result.get("url") or ""
 
-        if not li_result["success"] and li_result.get("error"):
-            # LinkedIn error — surface it loudly but don't block Medium email
-            emailer.send_error_email(
-                f"LinkedIn publish failed: {topic}",
-                li_result["error"],
+        # A configured LinkedIn that failed is a real failure: never record it as
+        # published, or the post is lost — publish_job only ever looks at
+        # status=="approved", so a wrongly-published post is never retried.
+        # "Not configured" is different: there is nothing to retry, and the
+        # Medium manual-paste email is still the real delivery path.
+        if li_result.get("configured") and not li_result["success"]:
+            error = li_result.get("error") or "unknown LinkedIn error"
+            pending_store.update_post(
+                post["id"],
+                status="failed",
+                publish_error=error,
+                failed_at=_now(),
             )
-            results["errors"].append({"id": post["id"], "topic": topic, "error": li_result["error"]})
+            try:
+                emailer.send_error_email(f"LinkedIn publish failed: {topic}", error)
+            except Exception as exc:
+                print(f"[scheduler] publish_job: error email failed — {exc}")
+
+            results["errors"].append({"id": post["id"], "topic": topic, "error": error})
+            print(f"[scheduler] publish_job: FAILED '{topic}' — {error}")
+            continue
 
         # Medium — always manual paste
         medium_result = publishers.publish_medium(content, title=topic)
         medium_md     = medium_result.get("markdown", content)
 
-        # Mark published
         pending_store.update_post(
             post["id"],
             status="published",
             linkedin_url=li_url,
+            published_at=_now(),
         )
 
         # Published email

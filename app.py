@@ -9,6 +9,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -101,22 +102,41 @@ async def generate(
 
     def crew_thread():
         try:
-            from src.crew import run_crew
+            from src.crew import run_crew, RunCancelled
             from src.utils import save_output
+            from src import pending as pending_store
 
             event_q.put({"type": "start", "topic": topic})
 
-            result = run_crew(
-                topic, event_q,
-                tone=tone, length=length, audience=audience,
-                notes=notes_with_voice,
-                critique_rounds=critique_rounds,
-            )
-
-            if cancel_event.is_set():
+            try:
+                result = run_crew(
+                    topic, event_q,
+                    tone=tone, length=length, audience=audience,
+                    notes=notes_with_voice,
+                    critique_rounds=critique_rounds,
+                    cancel_event=cancel_event,
+                )
+            except RunCancelled:
+                # Client went away or the run hit the deadline. Nothing to save
+                # and nobody to tell — just stop paying for it.
+                print(f"[app] crew cancelled for topic '{topic}'")
                 return
 
             filepath = save_output(result, topic)
+
+            # Manually-triggered generations bypassed the pending store entirely
+            # before this — only the scheduler's draft_job wrote to it — so the
+            # History drawer (which reads /api/posts) never showed them. Record
+            # every generation here too, regardless of trigger source.
+            try:
+                post = pending_store.create_post(
+                    topic, result, tone=tone, length=length,
+                    audience=audience, notes=notes,
+                )
+                pending_store.update_post(post["id"], status="generated", saved_to=filepath)
+            except Exception as exc:
+                print(f"[app] failed to record post in history: {exc}")
+
             event_q.put({"type": "final", "content": result, "saved_to": filepath})
         except Exception as exc:
             import traceback
@@ -129,12 +149,20 @@ async def generate(
     threading.Thread(target=crew_thread, daemon=True).start()
 
     async def event_generator():
-        loop    = asyncio.get_running_loop()
-        elapsed = 0.0
+        loop = asyncio.get_running_loop()
+        # Wall-clock deadline, checked every iteration. Counting only idle polls
+        # meant a run that kept emitting events never aged and could outlive the
+        # timeout indefinitely.
+        deadline = time.monotonic() + GENERATION_TIMEOUT
 
         while True:
             if await request.is_disconnected():
                 cancel_event.set()
+                break
+
+            if time.monotonic() >= deadline:
+                cancel_event.set()
+                yield {"data": json.dumps({"type": "error", "message": "Timed out"})}
                 break
 
             try:
@@ -143,11 +171,6 @@ async def generate(
                     lambda: event_q.get(timeout=POLL_INTERVAL),
                 )
             except queue.Empty:
-                elapsed += POLL_INTERVAL
-                if elapsed >= GENERATION_TIMEOUT:
-                    cancel_event.set()
-                    yield {"data": json.dumps({"type": "error", "message": "Timed out"})}
-                    break
                 continue
 
             if event is None:
@@ -192,6 +215,7 @@ async def review_page(post_id: str):
         "approved":  "#22D473",
         "skipped":   "#EF4444",
         "published": "#7C3AED",
+        "failed":    "#EF4444",
     }.get(status, "#7B769A")
 
     page = f"""<!DOCTYPE html>

@@ -1418,6 +1418,7 @@ body.phase--editing::before {
 .hcard__badge--approved { background: #14532D; color: #22D473; }
 .hcard__badge--skipped  { background: #1F2937; color: #9CA3AF; }
 .hcard__badge--published{ background: #0F2828; color: var(--teal-b); }
+.hcard__badge--generated{ background: #1E1B4B; color: #A78BFA; }
 .hcard__meta { font-size: .68rem; color: var(--text-3); display: flex; gap: .5rem; }
 
 /* ─── Personalization Welcome Modal ──────────────────────────────────────── */

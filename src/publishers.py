@@ -47,12 +47,17 @@ def markdown_to_linkedin(md: str) -> str:
 def publish_linkedin(text: str) -> dict:
     """
     Post `text` to LinkedIn. Truncates at 2900 chars.
-    Returns {"success": bool, "url": str | None, "error": str | None}.
+    Returns {"success": bool, "url": str | None, "error": str | None,
+             "configured": bool}.
     401 is surfaced as a loud actionable error (not silently retried).
+
+    `configured` lets callers tell "there is no LinkedIn to post to" (nothing to
+    retry, not a failure) apart from "the API call actually failed" (a real
+    failure that must not be recorded as a successful publish).
     """
     if not _li_configured():
         print("[publishers] LinkedIn not configured — skipping post (dummy credentials).")
-        return {"success": False, "url": None, "error": "LinkedIn not configured"}
+        return {"success": False, "url": None, "error": None, "configured": False}
 
     token      = os.getenv("LINKEDIN_ACCESS_TOKEN")
     person_urn = os.getenv("LINKEDIN_PERSON_URN", "")
@@ -85,23 +90,24 @@ def publish_linkedin(text: str) -> dict:
             timeout=30,
         )
     except requests.RequestException as exc:
-        return {"success": False, "url": None, "error": str(exc)}
+        return {"success": False, "url": None, "error": str(exc), "configured": True}
 
     if resp.status_code == 401:
         msg = "LinkedIn token expired — re-run OAuth to get a new 60-day token."
         print(f"[publishers] {msg}")
-        return {"success": False, "url": None, "error": msg}
+        return {"success": False, "url": None, "error": msg, "configured": True}
 
     if resp.status_code not in (200, 201):
         return {
             "success": False,
             "url": None,
             "error": f"LinkedIn API error {resp.status_code}: {resp.text[:200]}",
+            "configured": True,
         }
 
     post_id = resp.headers.get("x-restli-id", "")
     url = f"https://www.linkedin.com/feed/update/{post_id}/" if post_id else None
-    return {"success": True, "url": url, "error": None}
+    return {"success": True, "url": url, "error": None, "configured": True}
 
 
 def publish_medium(markdown: str, title: str = "") -> dict:

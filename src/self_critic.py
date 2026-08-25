@@ -23,14 +23,18 @@ _CRITIC_PROMPTS = {
     "writer": (
         "You are an Expert Technical Writer. Critically review your own blog post draft.\n"
         "Current quality metrics:\n{metrics_str}\n\n"
-        "Weaknesses to target: weak hook, missing H2 headers, long sentences hurting readability.\n"
+        "Weaknesses to target: weak hook, missing H2 headers, long sentences hurting\n"
+        "readability, stock phrases and cliches, heavy hedging, and monotone sentence\n"
+        "rhythm (low sentence variety means every sentence is the same length — vary it).\n"
         "Rewrite the COMPLETE post to address them. Output ONLY the revised post, no preamble.\n\n"
         "--- ORIGINAL ---\n{output}"
     ),
     "editor": (
         "You are a Chief Editor. Critically review your own edited blog post.\n"
         "Current quality metrics:\n{metrics_str}\n\n"
-        "Weaknesses to target: few transition phrases, passive voice overuse, monotonous sentence length.\n"
+        "Weaknesses to target: passive voice overuse, monotonous sentence length, and\n"
+        "sections that jump without connecting. Improve transitions by making the logical\n"
+        "link explicit, NOT by inserting 'Moreover' / 'Furthermore' — those read as filler.\n"
         "Rewrite the COMPLETE post to address them. Output ONLY the revised post, no preamble.\n\n"
         "--- ORIGINAL ---\n{output}"
     ),
@@ -59,10 +63,14 @@ def self_critique_loop(
     output: str,
     event_queue: "queue.Queue | None",
     max_iter: int = 2,
+    cancel_event=None,
 ) -> tuple:
     """
     Run up to max_iter self-critique rounds on output.
     Returns (final_output, metrics_history_list).
+
+    If cancel_event is set, stops before starting another round and returns the
+    best output so far; the caller re-checks and aborts the run.
     """
     from src.metrics import METRIC_LABELS
 
@@ -78,6 +86,8 @@ def self_critique_loop(
     emit({"type": "metrics", "agent": agent_name, "iteration": 0, "metrics": m0})
 
     for i in range(1, max_iter + 1):
+        if cancel_event is not None and cancel_event.is_set():
+            break
         emit({"type": "critique_start", "agent": agent_name, "iteration": i})
         emit({"type": "log", "agent": agent_name,
               "message": f"Self-reviewing output (round {i}/{max_iter})…"})

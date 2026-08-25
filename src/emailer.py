@@ -20,6 +20,11 @@ from email.mime.text import MIMEText
 
 _DUMMY_MARKER = "dummy"
 
+# smtplib defaults to the global socket timeout, which is None — a hung Gmail
+# connection would block forever, and _send() is called from inside synchronous
+# request handlers (/api/posts/{id}/revise, /api/jobs/publish). Bound it.
+_SMTP_TIMEOUT = float(os.getenv("SMTP_TIMEOUT_SECONDS", "20"))
+
 
 def _cfg():
     return {
@@ -46,7 +51,7 @@ def _send(subject: str, html_body: str) -> None:
     msg["To"]      = cfg["notify"]
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=_SMTP_TIMEOUT) as server:
         server.login(cfg["user"], cfg["password"])
         server.sendmail(cfg["user"], cfg["notify"], msg.as_string())
 

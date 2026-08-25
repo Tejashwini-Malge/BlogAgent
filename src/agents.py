@@ -1,8 +1,11 @@
 import os
+import re
 import time
 from dotenv import load_dotenv
 from crewai import Agent
 from langchain_openai import ChatOpenAI
+
+from src.tools import RESEARCH_TOOLS
 
 # override=True ensures .env values take precedence over any system-level env vars
 # (e.g. a system OPENAI_API_KEY pointing at OpenAI instead of OpenRouter)
@@ -11,7 +14,7 @@ load_dotenv(override=True)
 _api_key        = (os.getenv("OPENAI_API_KEY") or "").strip()
 _api_base       = os.getenv("OPENAI_API_BASE", "https://openrouter.ai/api/v1").strip()
 _model          = os.getenv("OPENAI_MODEL_NAME", "openai/gpt-3.5-turbo").strip()
-_fallback_model = os.getenv("OPENAI_FALLBACK_MODEL_NAME", "llama-3.1-8b-instant").strip()
+_fallback_model = os.getenv("OPENAI_FALLBACK_MODEL_NAME", "openai/gpt-oss-20b").strip()
 _llm_timeout    = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "25"))
 
 if not _api_key:
@@ -56,27 +59,52 @@ def _is_transient_connection_error(exc: Exception) -> bool:
     ))
 
 
-_CONNECTION_RETRIES = 1       # attempts on the SAME model before falling back to the other model
-_CONNECTION_RETRY_DELAY = 1   # seconds between retries
+_RETRY_AFTER_RE = re.compile(r"try again in (\d+(?:\.\d+)?)s", re.IGNORECASE)
+
+
+def _retry_after_seconds(exc: Exception, default: float = 3.0, cap: float = 15.0) -> float:
+    """
+    Groq's 429 body names the exact wait ("Please try again in 8.77s"). Honor
+    that instead of guessing — retrying before the token bucket actually
+    refills just burns another 429 for nothing. Capped so one worst-case
+    quota reset can't stall a pipeline stage for a full minute.
+    """
+    match = _RETRY_AFTER_RE.search(str(exc))
+    if match:
+        return min(float(match.group(1)) + 0.5, cap)  # small buffer past the stated reset
+    return default
+
+
+_CONNECTION_RETRIES = 2       # attempts on the SAME model before falling back to the other model
+_CONNECTION_RETRY_DELAY = 1   # seconds between transient-connection-error retries
 
 
 class FallbackLLM:
     """
-    Invokes the primary model (one attempt, bounded by OPENAI_TIMEOUT_SECONDS
+    Invokes the primary model (bounded by OPENAI_TIMEOUT_SECONDS per attempt
     so a hung connection can't stall the whole run), then:
-      - on a 429/rate-limit error, retries the call on the fallback model
-        (Groq quotas are per-model, so the fallback keeps runs alive after
-        the primary's daily token budget is exhausted).
-      - on a connection error, also tries the fallback model once before
-        giving up, in case the issue is model- or endpoint-specific.
-    Worst case per invoke() is ~2x OPENAI_TIMEOUT_SECONDS, not a multiple of
-    retry attempts — kept deliberately low since self-critique rounds chain
-    several invoke() calls back to back.
+      - on a 429/rate-limit error, first retries the SAME model after the
+        provider-stated wait — a 429 usually means "try again in a few
+        seconds," not "this model is unusable," and switching models doesn't
+        help if the fallback shares/has its own similarly-small TPM budget
+        (Groq's free tier caps are low enough that a few pipeline calls in a
+        row can exhaust either model on their own). Only after those retries
+        are exhausted does it fall back to the other model.
+      - on a connection error, retries the same model with a short fixed
+        delay, then falls back to the other model if it keeps failing.
     """
 
     def __init__(self, primary, fallback):
         self._primary  = primary
         self._fallback = fallback
+
+    def bind_tools(self, tools):
+        """Return a new FallbackLLM with `tools` bound on both models, so
+        tool-calling agents get the same retry/fallback behavior as plain invoke()."""
+        return FallbackLLM(
+            self._primary.bind_tools(tools),
+            self._fallback.bind_tools(tools) if self._fallback is not None else None,
+        )
 
     def _invoke_with_retries(self, model, messages, label):
         last_exc = None
@@ -85,10 +113,17 @@ class FallbackLLM:
                 return model.invoke(messages)
             except Exception as exc:
                 last_exc = exc
-                if not _is_transient_connection_error(exc) or attempt == _CONNECTION_RETRIES:
+                if attempt == _CONNECTION_RETRIES:
                     raise
-                print(f"[agents] {label} connection error (attempt {attempt}/{_CONNECTION_RETRIES}): {exc!r} — retrying")
-                time.sleep(_CONNECTION_RETRY_DELAY)
+                if _is_rate_limit(exc):
+                    delay = _retry_after_seconds(exc)
+                    print(f"[agents] {label} rate-limited (attempt {attempt}/{_CONNECTION_RETRIES}) — waiting {delay:.1f}s")
+                elif _is_transient_connection_error(exc):
+                    delay = _CONNECTION_RETRY_DELAY
+                    print(f"[agents] {label} connection error (attempt {attempt}/{_CONNECTION_RETRIES}): {exc!r} — retrying")
+                else:
+                    raise
+                time.sleep(delay)
         raise last_exc  # unreachable, keeps type-checkers happy
 
     def invoke(self, messages):
@@ -98,7 +133,7 @@ class FallbackLLM:
             if self._fallback is None:
                 raise
             if _is_rate_limit(exc):
-                print(f"[agents] {_model} rate-limited; retrying on {_fallback_model}")
+                print(f"[agents] {_model} still rate-limited after retries; trying {_fallback_model}")
             elif _is_transient_connection_error(exc):
                 print(f"[agents] {_model} unreachable after retries; trying {_fallback_model}: {exc!r}")
             else:
@@ -108,6 +143,10 @@ class FallbackLLM:
 
 # Use this for direct .invoke() calls (crew pipeline, self-critique, revisions)
 smart_llm = FallbackLLM(llm, _fallback_llm)
+
+# Tool-bound variant for the research phase: model picks which of the 4
+# search tools to call (and with what query), capped to one decision round.
+research_llm = smart_llm.bind_tools(RESEARCH_TOOLS)
 
 researcher = Agent(
     role="Senior Research Analyst",
@@ -120,6 +159,7 @@ researcher = Agent(
         "complex topics for non-expert audiences. You never fabricate facts."
     ),
     llm=llm,
+    tools=RESEARCH_TOOLS,
     verbose=True,
     allow_delegation=False,
 )
