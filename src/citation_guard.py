@@ -18,6 +18,18 @@ _CITATION_RE = re.compile(
     r"\(Source:\s*(?:\[[^\]]*\]\()?(https?://[^\s)\]]+)\)?\)?", re.IGNORECASE
 )
 
+# A citation carrying no real http(s) target at all — most often the prompt's
+# own "(Source: <url>)" notation copied out literally, but also things like
+# "(Source: the research brief)". _CITATION_RE can't see these (it requires a
+# URL to match), so without this they sail through every check and land in the
+# published post, which is worse than having no citation: it looks like a
+# broken link rather than an unsourced claim. The negative lookahead is bounded
+# to the current citation by [^)]*, so a real "(Source: [Name](https://...))"
+# still contains its URL before any ")" and is left alone.
+_PLACEHOLDER_CITATION_RE = re.compile(
+    r"\(Source:(?![^)]*https?://)[^)]*\)", re.IGNORECASE
+)
+
 
 def _build_canonical_labels() -> dict:
     labels = {}
@@ -56,4 +68,9 @@ def strip_unverified_citations(text: str, allowed_domains: set) -> str:
         return f"(Source: [{_label_for(domain)}]({url}))"
 
     cleaned = _CITATION_RE.sub(_replace, text)
-    return re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = _PLACEHOLDER_CITATION_RE.sub("", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    # Removing a citation mid-sentence leaves the space that preceded it
+    # stranded in front of the punctuation ("ship faster . Done."), which reads
+    # as a typo in the published post. Close that gap.
+    return re.sub(r"[ \t]+([.,;:!?])", r"\1", cleaned)
