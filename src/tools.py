@@ -8,6 +8,13 @@ different sources, not the same web search with different words appended).
 search_real_world_example stays on live DuckDuckGo search (ddgs) since case
 studies aren't concentrated in a handful of feeds — a live search fits better.
 
+If the curated feeds for search_news/search_magazines load fine but nothing
+clears the relevance floor (STATUS_EMPTY), each falls back to the same live
+DuckDuckGo search, tagged under its own tool name so the run record still
+shows which tool produced the result. This only fires on a genuine miss, not
+on a feed outage (STATUS_ERROR) — an outage should keep reading as "we don't
+know", not be quietly papered over by a web search.
+
 Each tool exists in two forms:
 
   * an implementation (`TOOL_IMPLS[name]`) returning a `ToolOutcome`, which
@@ -40,12 +47,17 @@ _FEED_TIMEOUT = 8
 _HEADERS = {"User-Agent": "Mozilla/5.0 (BlogAgent research tool)"}
 
 NEWS_FEEDS = [
-    ("TechCrunch",  "https://techcrunch.com/feed/"),
-    ("Hacker News", "https://hnrss.org/frontpage"),
+    ("TechCrunch",   "https://techcrunch.com/feed/"),
+    ("Hacker News",  "https://hnrss.org/frontpage"),
+    ("The Verge",    "https://www.theverge.com/rss/index.xml"),
+    ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
+    ("VentureBeat",  "https://venturebeat.com/feed/"),
 ]
 MAGAZINE_FEEDS = [
     ("MIT Technology Review", "https://www.technologyreview.com/feed/"),
     ("IEEE Spectrum",         "https://spectrum.ieee.org/rss/fulltext"),
+    ("Wired",                 "https://www.wired.com/feed/rss"),
+    ("Fast Company",          "https://www.fastcompany.com/technology/rss"),
 ]
 BLOG_FEEDS = [
     ("GitHub Blog",  "https://github.blog/feed/"),
@@ -228,37 +240,28 @@ def _fetch_entries(tool_name: str, feeds, query: str, max_results: int) -> ToolO
     return outcome
 
 
-def _impl_news(query: str) -> ToolOutcome:
-    return _fetch_entries("search_news", NEWS_FEEDS, query, _MAX_RESULTS)
-
-
-def _impl_magazines(query: str) -> ToolOutcome:
-    return _fetch_entries("search_magazines", MAGAZINE_FEEDS, query, _MAX_RESULTS)
-
-
-def _impl_blogs(query: str) -> ToolOutcome:
-    return _fetch_entries("search_blogs", BLOG_FEEDS, query, _MAX_RESULTS)
-
-
-def _impl_real_world_example(query: str) -> ToolOutcome:
+def _ddgs_search(tool_name: str, query: str, full_query: str) -> ToolOutcome:
+    """
+    Live DuckDuckGo search, tagged under `tool_name` so the run record shows
+    which tool actually produced the result rather than always reading
+    "search_real_world_example".
+    """
     started = time.monotonic()
-    outcome = ToolOutcome(tool="search_real_world_example", query=query)
+    outcome = ToolOutcome(tool=tool_name, query=query)
 
     try:
         with DDGS(timeout=_FEED_TIMEOUT) as ddgs:
-            results = list(ddgs.text(
-                f"{query} case study real-world example", max_results=_MAX_RESULTS,
-            ))
+            results = list(ddgs.text(full_query, max_results=_MAX_RESULTS))
     except Exception as exc:
         outcome.status = STATUS_ERROR
         outcome.error = str(exc)
-        outcome.text = f"Example search failed: {exc}"
+        outcome.text = f"Web search failed: {exc}"
         outcome.elapsed_ms = int((time.monotonic() - started) * 1000)
         return outcome
 
     if not results:
         outcome.status = STATUS_EMPTY
-        outcome.text = "No concrete real-world examples found for this query."
+        outcome.text = "No results found for this query."
         outcome.elapsed_ms = int((time.monotonic() - started) * 1000)
         return outcome
 
@@ -276,6 +279,35 @@ def _impl_real_world_example(query: str) -> ToolOutcome:
     outcome.status = STATUS_OK
     outcome.text = "\n".join(lines)
     outcome.elapsed_ms = int((time.monotonic() - started) * 1000)
+    return outcome
+
+
+def _impl_news(query: str) -> ToolOutcome:
+    outcome = _fetch_entries("search_news", NEWS_FEEDS, query, _MAX_RESULTS)
+    if outcome.status != STATUS_EMPTY:
+        return outcome
+    fallback = _ddgs_search("search_news", query, f"{query} news")
+    return fallback if fallback.status == STATUS_OK else outcome
+
+
+def _impl_magazines(query: str) -> ToolOutcome:
+    outcome = _fetch_entries("search_magazines", MAGAZINE_FEEDS, query, _MAX_RESULTS)
+    if outcome.status != STATUS_EMPTY:
+        return outcome
+    fallback = _ddgs_search("search_magazines", query, f"{query} analysis")
+    return fallback if fallback.status == STATUS_OK else outcome
+
+
+def _impl_blogs(query: str) -> ToolOutcome:
+    return _fetch_entries("search_blogs", BLOG_FEEDS, query, _MAX_RESULTS)
+
+
+def _impl_real_world_example(query: str) -> ToolOutcome:
+    outcome = _ddgs_search(
+        "search_real_world_example", query, f"{query} case study real-world example",
+    )
+    if outcome.status == STATUS_EMPTY:
+        outcome.text = "No concrete real-world examples found for this query."
     return outcome
 
 

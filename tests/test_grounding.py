@@ -155,7 +155,7 @@ def test_same_url_from_two_feeds_counts_once(monkeypatch):
     })())
 
     outcome = tools._fetch_entries("search_news", tools.NEWS_FEEDS, "rust async", 5)
-    assert len(tools.NEWS_FEEDS) == 2          # both feeds returned that entry
+    assert len(tools.NEWS_FEEDS) >= 2          # every feed returned that entry
     assert outcome.urls == ["https://shared.com/same-story"]
 
 
@@ -178,6 +178,84 @@ def test_partial_feed_failure_still_records_the_error(monkeypatch):
     outcome = tools._fetch_entries("search_news", tools.NEWS_FEEDS, "rust async", 5)
     assert outcome.status == tools.STATUS_OK
     assert "techcrunch down" in outcome.error
+
+
+# ── news/magazines DDGS fallback ──────────────────────────────────────────────
+
+class _FakeDDGS:
+    """Stand-in for ddgs.DDGS, supporting `with DDGS(...) as ddgs: ddgs.text(...)`."""
+    def __init__(self, results=None, raise_exc=None):
+        self._results = results or []
+        self._raise = raise_exc
+
+    def __call__(self, *a, **k):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def text(self, query, max_results=5):
+        if self._raise:
+            raise self._raise
+        return self._results
+
+
+def _empty_feeds(monkeypatch):
+    """Feeds load fine but match nothing, so _fetch_entries returns STATUS_EMPTY."""
+    monkeypatch.setattr(tools.requests, "get", lambda *a, **k: _FakeResponse())
+    monkeypatch.setattr(tools.feedparser, "parse", lambda _: type("P", (), {
+        "entries": [{"title": "Sourdough starters", "summary": "bread", "link": "https://b.com/1"}],
+    })())
+
+
+def test_news_falls_back_to_web_search_when_feeds_are_empty(monkeypatch):
+    _empty_feeds(monkeypatch)
+    monkeypatch.setattr(tools, "DDGS", _FakeDDGS(results=[
+        {"title": "Layoffs surge in 2024", "body": "...", "url": "https://news.example.com/a"},
+    ]))
+
+    outcome = tools._impl_news("rise of layoffs 2024")
+    assert outcome.status == tools.STATUS_OK
+    assert outcome.tool == "search_news"    # attributed to search_news, not the fallback
+    assert outcome.urls == ["https://news.example.com/a"]
+
+
+def test_magazines_falls_back_to_web_search_when_feeds_are_empty(monkeypatch):
+    _empty_feeds(monkeypatch)
+    monkeypatch.setattr(tools, "DDGS", _FakeDDGS(results=[
+        {"title": "Layoffs analysis", "body": "...", "url": "https://mag.example.com/a"},
+    ]))
+
+    outcome = tools._impl_magazines("rise of layoffs 2024")
+    assert outcome.status == tools.STATUS_OK
+    assert outcome.tool == "search_magazines"
+
+
+def test_news_stays_empty_when_fallback_also_finds_nothing(monkeypatch):
+    _empty_feeds(monkeypatch)
+    monkeypatch.setattr(tools, "DDGS", _FakeDDGS(results=[]))
+
+    outcome = tools._impl_news("an extremely obscure query")
+    assert outcome.status == tools.STATUS_EMPTY
+    assert "closely enough" in outcome.text   # original curated-feed message, not swallowed
+
+
+def test_news_does_not_fall_back_on_feed_outage(monkeypatch):
+    """STATUS_ERROR (feeds down) must stay an error, not get papered over by a
+    web search — that would hide a real outage as a false-positive grounding."""
+    def boom(*a, **k):
+        raise ConnectionError("dns failure")
+    monkeypatch.setattr(tools.requests, "get", boom)
+    monkeypatch.setattr(tools, "DDGS", _FakeDDGS(results=[
+        {"title": "Should never be reached", "body": "", "url": "https://x.com/1"},
+    ]))
+
+    outcome = tools._impl_news("kubernetes operators")
+    assert outcome.status == tools.STATUS_ERROR
+    assert outcome.results == []
 
 
 # ── the citation-guard path that produces WEAK ────────────────────────────────
