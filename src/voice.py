@@ -14,10 +14,12 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.paths import VOICE_DIR, data_file
+
 _BASE = Path(__file__).parent.parent
 _SAMPLES_DIR = _BASE / "voice_profile" / "samples"
 _STYLE_FILE  = _BASE / "voice_profile" / "style.md"
-_CORRECTIONS = _BASE / "data" / "corrections.jsonl"
+_CORRECTIONS = data_file("corrections.jsonl")
 
 
 def load_voice_profile() -> dict:

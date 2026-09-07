@@ -24,10 +24,11 @@ import json
 import threading
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
-_STORE = Path(__file__).parent.parent / "data" / "pending.json"
+from src.paths import data_file
+
+_STORE = data_file("pending.json")
 _lock = threading.Lock()
 
 
@@ -60,8 +61,16 @@ def create_post(
     length: str = "medium",
     audience: str = "general",
     notes: str = "",
+    grounding: dict | None = None,
+    run_id: str | None = None,
 ) -> dict:
-    """Create a new pending post. Returns the post dict."""
+    """
+    Create a new pending post. Returns the post dict.
+
+    `grounding` and `run_id` are optional so posts written before run records
+    existed still load: readers use post.get("grounding") and treat a missing
+    value as unknown rather than as grounded. No migration of pending.json.
+    """
     post = {
         "id": str(uuid.uuid4()),
         "topic": topic,
@@ -72,6 +81,8 @@ def create_post(
         "content": content,
         "status": "pending",
         "created_at": _now(),
+        "grounding": grounding,
+        "run_id": run_id,
         "approved_at": None,
         "published_at": None,
         "corrections": [],

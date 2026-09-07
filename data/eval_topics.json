@@ -1,0 +1,52 @@
+{
+  "topics": [
+    {
+      "topic": "Why small teams ship faster",
+      "tone": "conversational",
+      "length": "medium",
+      "audience": "general",
+      "grounding_expected": true,
+      "why": "Tech-adjacent and well covered by the engineering feeds. The baseline topic used throughout the Sept 2026 hardening work."
+    },
+    {
+      "topic": "What retrieval augmented generation actually solves",
+      "tone": "professional",
+      "length": "medium",
+      "audience": "technical",
+      "grounding_expected": true,
+      "why": "Squarely inside the feed set's subject matter. If this comes back ungrounded, retrieval is broken."
+    },
+    {
+      "topic": "Kubernetes operators explained",
+      "tone": "professional",
+      "length": "short",
+      "audience": "technical",
+      "grounding_expected": true,
+      "why": "Narrow and specific. Exercises whether scoring finds a precise match rather than only broad topics."
+    },
+    {
+      "topic": "Is remote work making engineering teams less productive",
+      "tone": "conversational",
+      "length": "medium",
+      "audience": "general",
+      "grounding_expected": true,
+      "why": "Has genuine live disagreement, so it exercises the counterpoint contract path in craft.py."
+    },
+    {
+      "topic": "The fear of starting in public",
+      "tone": "conversational",
+      "length": "medium",
+      "audience": "general",
+      "grounding_expected": false,
+      "why": "Personal growth. The feed set is tech-only, so this is EXPECTED to come back ungrounded — it is the control, not a failure. If it ever grounds, a feed changed."
+    },
+    {
+      "topic": "Why consistency beats perfection when learning to code",
+      "tone": "casual",
+      "length": "short",
+      "audience": "general",
+      "grounding_expected": false,
+      "why": "Second non-tech control. Two of them because a single control can't distinguish a feed gap from a bad day."
+    }
+  ]
+}

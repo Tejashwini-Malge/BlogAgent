@@ -93,7 +93,37 @@ def _base_template(title: str, body_html: str) -> str:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def send_review_email(post_id: str, topic: str, draft: str) -> None:
+def _grounding_banner(grounding: dict | None) -> str:
+    """
+    A warning above the draft when the post isn't actually sourced.
+
+    This email is the moment a human decides to publish, so it's the one place
+    the verdict has to appear — a label buried in a log file doesn't stop
+    anyone from approving an ungrounded post. Rendered inline (no CSS class) so
+    it survives Gmail's stylesheet stripping.
+    """
+    if not grounding:
+        return ""
+    level = grounding.get("level")
+    if level not in ("ungrounded", "weak"):
+        return ""
+
+    heading = ("Not grounded in any source" if level == "ungrounded"
+               else "Sources were found but none made it into the post")
+    return (
+        '<div style="background:#3B1F1F;border-left:4px solid #D97026;'
+        'padding:12px 16px;margin:0 0 18px;border-radius:4px;">'
+        f'<strong style="color:#F0A868;">⚠ {html.escape(heading)}</strong>'
+        f'<div style="color:#D8C9C0;font-size:.82rem;margin-top:6px;">'
+        f'{html.escape(grounding.get("reason", ""))}</div>'
+        '<div style="color:#9C8E86;font-size:.75rem;margin-top:6px;">'
+        'Every factual claim in this draft is unverified. Read it as opinion '
+        'before approving.</div></div>'
+    )
+
+
+def send_review_email(post_id: str, topic: str, draft: str,
+                      grounding: dict | None = None) -> None:
     """
     Sent at 8:30 AM after a draft is generated.
     Contains the full draft + approve / revise / skip action buttons.
@@ -103,6 +133,7 @@ def send_review_email(post_id: str, topic: str, draft: str) -> None:
 
     body = f"""
     <div class="sub">Blog draft ready for review</div>
+    {_grounding_banner(grounding)}
     <p><strong>Topic:</strong> {html.escape(topic)}</p>
     <p>
       <a href="{html.escape(review_url)}/approve" class="btn btn-approve">Approve</a>

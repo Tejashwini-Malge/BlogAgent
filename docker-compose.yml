@@ -5,7 +5,13 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      # Both point at mounted volumes below. Without this, state lives in the
+      # image layer and is lost every time the container is rebuilt.
+      DATA_DIR: /app/data
+      OUTPUT_DIR: /app/output
     volumes:
       - ./data:/app/data
+      - ./output:/app/output
       - ./voice_profile:/app/voice_profile
     restart: unless-stopped

@@ -53,6 +53,16 @@ def extract_cited_domains(text: str) -> set:
     return {urlparse(u).netloc.lower() for u in _CITATION_RE.findall(text)}
 
 
+def extract_cited_urls(text: str) -> set:
+    """
+    Distinct citation URLs in `text`. Unlike extract_cited_domains this keeps
+    the full URL, because two articles from the same publication are two
+    sources — collapsing them to one domain would undercount how well a post
+    is actually grounded.
+    """
+    return set(_CITATION_RE.findall(text))
+
+
 def strip_unverified_citations(text: str, allowed_domains: set) -> str:
     """
     Remove any (Source: url) whose domain isn't in `allowed_domains` (claim

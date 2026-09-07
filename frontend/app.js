@@ -114,7 +114,7 @@ const METRIC_LABELS_JS = {
   has_caveats:      'Has caveats',
   h2_count:         'H2 headers',
   avg_sentence_len: 'Avg sent len',
-  hook_score:       'Hook strength',
+  opener_score:     'Opening quality',
   transition_count: 'Transitions',
   passive_count:    'Passive voice',
 };
@@ -652,7 +652,126 @@ window.addEventListener('load', () => {
 
   const strip = $('schedStrip');
   if (strip) strip.style.display = 'inline-flex';
+  initScheduler();
 });
+
+/* ── Scheduler strip + popover ──────────────────────────────────────────── */
+let schedState = null;
+
+function fmtWhen(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d)) return '—';
+  const day  = d.toDateString() === new Date().toDateString() ? 'today' : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const time = d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  return `${day} ${time}`;
+}
+
+function fmtAgo(iso) {
+  if (!iso) return 'never';
+  const mins = Math.round((Date.now() - new Date(iso)) / 60000);
+  if (isNaN(mins))    return 'never';
+  if (mins < 1)       return 'just now';
+  if (mins < 60)      return `${mins}m ago`;
+  if (mins < 60 * 24) return `${Math.round(mins / 60)}h ago`;
+  return `${Math.round(mins / 1440)}d ago`;
+}
+
+function renderScheduler(s) {
+  schedState = s;
+  /* `available` must be in here too, or the dots go green while the label
+     reads UNAVAILABLE. Absent is treated as true — it's an optional field,
+     and defaulting a missing one to "broken" is the wrong way to be wrong. */
+  const usable = s.enabled && s.available !== false;
+  const live   = usable && s.running && !s.paused;
+
+  /* Dots: green only when the thing will actually fire. */
+  ['schedDraftDot', 'schedPublishDot'].forEach(id =>
+    $(id)?.classList.toggle('is-off', !live));
+
+  const stateEl = $('schedPopState');
+  if (stateEl) {
+    stateEl.textContent = !s.enabled           ? 'DISABLED'
+      : s.available === false                  ? 'UNAVAILABLE'
+      : !s.running                             ? 'STOPPED'
+      : s.paused                               ? 'PAUSED' : 'RUNNING';
+    stateEl.className = 'sched-pop__state ' +
+      (live ? 'is-on' : s.paused ? 'is-paused' : 'is-off');
+  }
+
+  const jobById = Object.fromEntries((s.jobs || []).map(j => [j.id, j]));
+  const runs    = s.last_runs || {};
+  const row = (k, v, cls = '') =>
+    `<div class="sched-pop__row"><span class="sched-pop__k">${escapeHtml(k)}</span>` +
+    `<span class="sched-pop__v ${cls}">${escapeHtml(v)}</span></div>`;
+
+  const jobBlock = (id, label) => {
+    const job = jobById[id];
+    const run = runs[id];
+    let out = row(label, job ? fmtWhen(job.next_run_at) : 'not scheduled');
+    if (run) {
+      out += row('  last', `${run.last_status} · ${fmtAgo(run.last_run_at)}`,
+                 `is-${run.last_status}`);
+      if (run.detail) out += row('  ', run.detail);
+    } else {
+      out += row('  last', 'no record', 'is-skipped');
+    }
+    return out;
+  };
+
+  const t = s.topics || {};
+  $('schedPopBody').innerHTML =
+    jobBlock('draft_job', 'Draft') +
+    '<div class="sched-pop__sep"></div>' +
+    jobBlock('publish_job', 'Publish') +
+    '<div class="sched-pop__sep"></div>' +
+    row('Topics queued', String(t.queued ?? 0)) +
+    (t.next_topic ? row('  next', t.next_topic) : '') +
+    (t.next_topic_attempts ? row('  attempts', `${t.next_topic_attempts} failed so far`, 'is-failed') : '') +
+    (t.failed ? row('  set aside', `${t.failed} topic(s)`, 'is-failed') : '');
+
+  const btn = $('schedToggleBtn');
+  if (btn) {
+    btn.textContent = s.paused ? 'Resume' : 'Pause';
+    btn.disabled    = !s.running;
+  }
+  $('schedPopHint').textContent = s.running ? '' : 'Scheduler is not running.';
+}
+
+async function fetchScheduler() {
+  try {
+    const r = await fetch('/api/scheduler');
+    if (r.ok) renderScheduler(await r.json());
+  } catch { /* nav decoration — a failed poll should never surface an error */ }
+}
+
+function initScheduler() {
+  fetchScheduler();
+
+  const pop = $('schedPop');
+  $('schedStrip')?.addEventListener('click', e => {
+    if (e.target.closest('.sched-pop')) return;   // clicks inside stay inside
+    pop.hidden = !pop.hidden;
+    if (!pop.hidden) fetchScheduler();
+    playKeyClick(0.08);
+  });
+
+  document.addEventListener('click', e => {
+    if (pop && !pop.hidden && !e.target.closest('#schedStrip')) pop.hidden = true;
+  });
+
+  $('schedToggleBtn')?.addEventListener('click', async () => {
+    const action = schedState?.paused ? 'resume' : 'pause';
+    try {
+      const r = await fetch(`/api/scheduler/${action}`, { method: 'POST' });
+      if (r.ok) renderScheduler(await r.json());
+      else      $('schedPopHint').textContent = 'Could not ' + action + '.';
+    } catch {
+      $('schedPopHint').textContent = 'Could not reach the server.';
+    }
+    playKeyClick(0.1);
+  });
+}
 window.addEventListener('resize', positionIndicator);
 
 /* ── Log ────────────────────────────────────────────────────────────────── */
@@ -925,6 +1044,63 @@ function escapeHtml(s) {
   ));
 }
 
+/* ── Grounding badge ────────────────────────────────────────────────────── */
+const groundingBadge  = $('groundingBadge');
+const groundingDetail = $('groundingDetail');
+
+const GROUNDING_LABEL = {
+  grounded:   'Grounded',
+  partial:    '1 source',
+  weak:       'Sources dropped',
+  ungrounded: 'Not grounded',
+};
+
+function renderGrounding(g) {
+  if (!groundingBadge || !g || !g.level) return;
+
+  const level = g.level;
+  groundingBadge.className = `grounding-badge is-${level}`;
+  groundingBadge.textContent =
+    `${GROUNDING_LABEL[level] || level} · ${g.sources_cited ?? 0}/${g.sources_retrieved ?? 0}`;
+  groundingBadge.title =
+    `${g.sources_cited ?? 0} source(s) cited in the post, ${g.sources_retrieved ?? 0} retrieved by search`;
+  groundingBadge.hidden = false;
+
+  /* undefined means "not reported" (e.g. reconstructed from the final event),
+     which is different from [] meaning "reported, and nothing ran". */
+  const calls = g.tool_calls;
+  const rows = (calls == null) ? ''
+    : calls.length
+    ? `<ul class="grounding-detail__list">${calls.map(c => `
+        <li class="grounding-detail__row">
+          <span class="grounding-detail__tool">${escapeHtml(c.tool || '')}</span>
+          <span class="grounding-detail__query">${escapeHtml(c.query || '')}</span>
+          <span class="grounding-detail__status s-${escapeHtml(c.status || '')}">${escapeHtml(
+            c.status === 'ok' ? `${c.n_results} found`
+              : c.status === 'empty' ? 'no match'
+              : c.error || 'error')}</span>
+        </li>`).join('')}</ul>`
+    : `<div class="grounding-detail__empty">No searches were run for this topic.</div>`;
+
+  groundingDetail.innerHTML =
+    `<p class="grounding-detail__reason">${escapeHtml(g.reason || '')}</p>${rows}`;
+}
+
+function resetGrounding() {
+  if (!groundingBadge) return;
+  groundingBadge.hidden = true;
+  groundingBadge.setAttribute('aria-expanded', 'false');
+  groundingDetail.hidden = true;
+  groundingDetail.innerHTML = '';
+}
+
+groundingBadge?.addEventListener('click', () => {
+  const open = groundingBadge.getAttribute('aria-expanded') === 'true';
+  groundingBadge.setAttribute('aria-expanded', String(!open));
+  groundingDetail.hidden = open;
+  playKeyClick(0.08);
+});
+
 /* ── SSE ────────────────────────────────────────────────────────────────── */
 function handleEvent(raw) {
   let e; try { e = JSON.parse(raw); } catch { return; }
@@ -932,6 +1108,7 @@ function handleEvent(raw) {
   switch (e.type) {
 
     case 'start':
+      resetGrounding();
       appendLog('system', `Starting crew · topic: "${e.topic}"`);
       progressRow.classList.add('is-visible');
       logsSection.classList.add('is-visible');
@@ -970,6 +1147,9 @@ function handleEvent(raw) {
     }
 
     case 'final': {
+      /* Belt and braces: the grounding event carries the tool-call detail, but
+         if it was somehow missed the verdict still rides along on 'final'. */
+      if (e.grounding && groundingBadge?.hidden) renderGrounding(e.grounding);
       currentResult = e.content || '';
       currentTopic  = topicInput.value.trim();
       stopCrawl(); stopAllTimers();
@@ -1006,6 +1186,16 @@ function handleEvent(raw) {
           fetchHistoryCount();
         });
       }, 300);
+      break;
+    }
+
+    case 'grounding': {
+      /* Arrives just before 'final'. Rendered now but only becomes visible
+         with the result card, so the badge and the post appear together. */
+      renderGrounding(e);
+      if (e.level === 'ungrounded' || e.level === 'weak') {
+        appendLog('system', `Grounding: ${e.level} — ${e.reason || ''}`);
+      }
       break;
     }
 

@@ -23,7 +23,14 @@ _CRITIC_PROMPTS = {
     "writer": (
         "You are an Expert Technical Writer. Critically review your own blog post draft.\n"
         "Current quality metrics:\n{metrics_str}\n\n"
-        "Weaknesses to target: weak hook, missing H2 headers, long sentences hurting\n"
+        # "weak hook" used to sit here next to a metric that scored hooks by
+        # counting clickbait words, so a revision round would have been told to
+        # punch up the opening and handed a number that rewarded exactly the
+        # phrasing craft.py bans. Both are now stated the same way.
+        "Weaknesses to target: a weak opening (it must be short, free of\n"
+        "scene-setting, and anchored to something concrete - never punched up with\n"
+        "clickbait words, questions, or exclamations), missing H2 headers,\n"
+        "long sentences hurting\n"
         "readability, stock phrases and cliches, heavy hedging, and monotone sentence\n"
         "rhythm (low sentence variety means every sentence is the same length — vary it).\n"
         "Rewrite the COMPLETE post to address them. Output ONLY the revised post, no preamble.\n\n"

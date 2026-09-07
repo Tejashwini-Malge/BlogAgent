@@ -42,6 +42,17 @@
             <span class="sched-dot" id="schedPublishDot"></span>
             <span>Publish 9:00</span>
           </span>
+          <div class="sched-pop" id="schedPop" hidden>
+            <div class="sched-pop__head">
+              <span class="sched-pop__title">Scheduler</span>
+              <span class="sched-pop__state" id="schedPopState">—</span>
+            </div>
+            <div class="sched-pop__body" id="schedPopBody"></div>
+            <div class="sched-pop__foot">
+              <button class="sched-pop__btn" id="schedToggleBtn" type="button">Pause</button>
+              <span class="sched-pop__hint" id="schedPopHint"></span>
+            </div>
+          </div>
         </div>
         <button class="btn-sound" id="soundBtn" type="button" title="Mute sounds" aria-label="Toggle typewriter sounds">
           <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
@@ -289,6 +300,8 @@
             <span class="result-ready-dot"></span>
             <span class="result-title">Blog post ready</span>
             <span class="result-wordcount" id="wordCount"></span>
+            <button class="grounding-badge" id="groundingBadge" type="button"
+                    hidden aria-expanded="false" aria-controls="groundingDetail"></button>
           </div>
           <div class="result-header__right">
             <div class="tabs" id="tabs">
@@ -315,6 +328,8 @@
             </div>
           </div>
         </div>
+
+        <div class="grounding-detail" id="groundingDetail" hidden></div>
 
         <div class="result-body">
           <div class="tab-panel is-active" id="panelPreview">

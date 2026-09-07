@@ -33,6 +33,52 @@ def _sentences(text):
     return [p for p in re.split(r'(?<=[.!?])\s+', text.strip()) if len(p.strip()) > 3]
 
 
+# -- Content-word tokenizer (shared by feed relevance scoring in src.tools and
+#    subtopic-coverage checking in src.writer_agent) --------------------------
+#
+# Both jobs are "does this text talk about that text", and both were failing the
+# same way: raw word-set intersection meant "AI agents" scored zero against an
+# article titled "Agentic workflows", and a subtopic counted as covered because
+# two of its stopwords appeared somewhere in the draft. One tokenizer so the two
+# can't drift apart.
+
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do", "does",
+    "for", "from", "has", "have", "how", "in", "into", "is", "it", "its", "of",
+    "on", "or", "our", "that", "the", "their", "them", "then", "there", "these",
+    "they", "this", "to", "was", "were", "what", "when", "which", "who", "why",
+    "will", "with", "you", "your", "we", "us", "not", "more", "most", "other",
+    "some", "such", "than", "too", "very", "just", "also", "about", "over",
+}
+
+# Crude suffix stripping — deliberately not a real stemmer. A Porter
+# implementation would be another dependency and a lot of surface area for a
+# gain that doesn't show up here: the cases that actually matter are plural/
+# gerund forms of the same noun ("agents"/"agent", "scaling"/"scale").
+_SUFFIXES = ("ations", "ation", "ingly", "ings", "edly", "ing", "ies", "ers",
+             "er", "ed", "es", "ly", "s")
+_MIN_STEM = 4
+
+
+def stem(word: str) -> str:
+    word = word.lower()
+    for suffix in _SUFFIXES:
+        if word.endswith(suffix) and len(word) - len(suffix) >= _MIN_STEM:
+            base = word[: -len(suffix)]
+            # "ies" -> "y" keeps studies/study together; bare truncation
+            # would leave "stud", which matches nothing.
+            return base + "y" if suffix == "ies" else base
+    return word
+
+
+def content_tokens(text: str) -> set:
+    """Lowercased, stopword-stripped, crudely stemmed content words."""
+    return {
+        stem(w) for w in re.findall(r"[A-Za-z0-9]+", text or "")
+        if len(w) > 2 and w.lower() not in STOPWORDS
+    }
+
+
 # -- Phrase inventories ------------------------------------------------------
 
 # Multiword constructions that read as machine-written almost regardless of
@@ -116,6 +162,17 @@ _AI_TELL_RE = _phrase_re(AI_TELL_PHRASES)
 _CLICHE_RE = _phrase_re(CLICHES)
 _HEDGE_RE = _phrase_re(HEDGES)
 _THROAT_RE = re.compile("|".join(THROAT_CLEARING), re.IGNORECASE)
+
+# CRAFT_RULES already says "Never open with a definition" and 'Cut "there is /
+# there are" openings', but opener_problems never checked either, so both rules
+# were advice to the model with no detector behind them — the exact split this
+# module exists to close. Kept to unambiguous forms: "the problem is a hard one"
+# is ordinary prose, not a definition, and must not be flagged.
+_DEFINITION_OPENER_RE = re.compile(
+    r"\b(?:is|are)\s+defined\s+as\b|\bcan\s+be\s+defined\s+as\b|\brefers\s+to\b",
+    re.IGNORECASE,
+)
+_EXPLETIVE_OPENER_RE = re.compile(r"^\W*there\s+(?:is|are|was|were)\b", re.IGNORECASE)
 _COUNTERPOINT_RE = re.compile("|".join(_COUNTERPOINT_MARKERS), re.IGNORECASE)
 
 # Strip Markdown headers/citations before prose-level measurement - a URL in
@@ -173,6 +230,16 @@ def opener_problems(text: str) -> list:
     problems = []
     if _THROAT_RE.search(first):
         problems.append(f'the opening line is throat-clearing ("{first[:60]}...")')
+    if _DEFINITION_OPENER_RE.search(first):
+        problems.append(
+            f'the opening line is a definition ("{first[:60]}...") - open with a '
+            "specific detail, a number, or a claim someone could disagree with"
+        )
+    if _EXPLETIVE_OPENER_RE.match(first):
+        problems.append(
+            f'the opening line starts with "there is/are" ("{first[:40]}...") - '
+            "lead with the actual subject and an active verb"
+        )
     if len(_words(first)) > OPENER_MAX_WORDS:
         problems.append(
             f"the opening sentence is {len(_words(first))} words "

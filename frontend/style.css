@@ -1041,6 +1041,66 @@ body.phase--editing::before {
   background: rgba(180,160,120,0.15); border: 1px solid rgba(180,160,120,0.3);
   padding: .12rem .48rem; border-radius: 99px;
 }
+/* Grounding badge — says whether the post actually rests on real sources.
+   Teal reads as "fine" in this palette and orange as "look at this", which is
+   exactly the distinction: grounded/partial are normal, weak/ungrounded want
+   the reader's attention before they publish. */
+.grounding-badge {
+  font-family: inherit;
+  font-size: .68rem; font-weight: 600; letter-spacing: .02em;
+  padding: .14rem .5rem; border-radius: 99px;
+  cursor: pointer; white-space: nowrap;
+  display: inline-flex; align-items: center; gap: .3rem;
+  transition: filter .15s ease;
+}
+.grounding-badge::after {
+  content: '▾'; font-size: .6rem; opacity: .65;
+  transition: transform .18s ease;
+}
+.grounding-badge[aria-expanded="true"]::after { transform: rotate(180deg); }
+.grounding-badge:hover { filter: brightness(1.08); }
+
+.grounding-badge.is-grounded {
+  color: #1B5551; background: var(--teal-tint);
+  border: 1px solid rgba(93,173,168,0.55);
+}
+.grounding-badge.is-partial {
+  color: #2C5C58; background: transparent;
+  border: 1px dashed rgba(93,173,168,0.7);
+}
+.grounding-badge.is-weak {
+  color: #8A3F0E; background: var(--orange-tint);
+  border: 1px solid rgba(217,112,38,0.6);
+}
+.grounding-badge.is-ungrounded {
+  color: #FFF3E8; background: var(--orange);
+  border: 1px solid var(--orange);
+}
+
+.grounding-detail {
+  padding: .8rem 1.4rem .9rem 3.5rem;
+  border-bottom: 1px solid rgba(180,160,120,0.2);
+  border-left: 3px solid rgba(210,60,40,0.22);
+  background: rgba(180,160,120,0.08);
+  font-size: .76rem; color: var(--paper-ink2);
+}
+.grounding-detail__reason { margin: 0 0 .55rem; line-height: 1.5; }
+.grounding-detail__list { list-style: none; margin: 0; padding: 0; display: grid; gap: .3rem; }
+.grounding-detail__row {
+  display: flex; align-items: baseline; gap: .5rem;
+  font-family: 'Courier Prime', monospace; font-size: .72rem;
+}
+.grounding-detail__tool { color: var(--paper-ink); min-width: 11.5rem; }
+.grounding-detail__query { color: var(--paper-faint); flex: 1; }
+.grounding-detail__status {
+  font-weight: 700; text-transform: uppercase; font-size: .64rem;
+  letter-spacing: .04em;
+}
+.grounding-detail__status.s-ok    { color: #1B7A54; }
+.grounding-detail__status.s-empty { color: #8A6A2A; }
+.grounding-detail__status.s-error { color: #A83B12; }
+.grounding-detail__empty { color: var(--paper-faint); font-style: italic; }
+
 .result-header__right { display: flex; align-items: center; gap: .65rem; }
 
 /* Tabs on paper background */
@@ -1289,7 +1349,62 @@ body.phase--editing::before {
   display: inline-flex; align-items: center; gap: .55rem;
   font-family: 'JetBrains Mono', monospace; font-size: .68rem;
   color: var(--text-3);
+  position: relative;
 }
+
+/* Scheduler popover — answers "is it on, when does it next fire, and did it
+   do anything this morning" without opening the server logs. */
+.sched-pop {
+  position: absolute; top: calc(100% + .5rem); right: 0; z-index: 60;
+  min-width: 19rem;
+  background: var(--surface-2, #14201F);
+  border: 1px solid var(--border-md, rgba(93,173,168,0.3));
+  border-radius: var(--r-sm); padding: .7rem .8rem;
+  box-shadow: 0 10px 28px rgba(0,0,0,0.5);
+  font-family: 'JetBrains Mono', monospace;
+  text-align: left; cursor: default;
+}
+.sched-pop__head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: .6rem; padding-bottom: .5rem; margin-bottom: .5rem;
+  border-bottom: 1px solid var(--border, rgba(255,255,255,0.08));
+}
+.sched-pop__title {
+  font-family: 'Special Elite', serif; font-size: .82rem; color: var(--teal-c);
+}
+.sched-pop__state { font-size: .62rem; font-weight: 700; letter-spacing: .04em; }
+.sched-pop__state.is-on      { color: var(--green, #22D473); }
+.sched-pop__state.is-paused  { color: var(--orange-c); }
+.sched-pop__state.is-off     { color: var(--text-3); }
+
+.sched-pop__row {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: .7rem; font-size: .66rem; padding: .18rem 0;
+}
+.sched-pop__k { color: var(--text-3); white-space: nowrap; }
+.sched-pop__v { color: var(--text-2); text-align: right; }
+.sched-pop__v.is-ok      { color: var(--green, #22D473); }
+.sched-pop__v.is-failed  { color: var(--orange-c); }
+.sched-pop__v.is-skipped { color: var(--text-3); }
+.sched-pop__sep {
+  border-top: 1px solid var(--border, rgba(255,255,255,0.08));
+  margin: .45rem 0 .35rem;
+}
+.sched-pop__foot {
+  display: flex; align-items: center; gap: .6rem;
+  margin-top: .55rem; padding-top: .5rem;
+  border-top: 1px solid var(--border, rgba(255,255,255,0.08));
+}
+.sched-pop__btn {
+  font-family: inherit; font-size: .64rem; font-weight: 700;
+  color: var(--teal-c); background: var(--teal-tint);
+  border: 1px solid rgba(93,173,168,0.45); border-radius: var(--r-sm);
+  padding: .24rem .6rem; cursor: pointer;
+  transition: filter .14s;
+}
+.sched-pop__btn:hover:not(:disabled) { filter: brightness(1.2); }
+.sched-pop__btn:disabled { opacity: .45; cursor: not-allowed; }
+.sched-pop__hint { font-size: .6rem; color: var(--text-3); }
 .sched-item {
   display: inline-flex; align-items: center; gap: .3rem;
   cursor: pointer; padding: .2rem .4rem; border-radius: var(--r-sm);

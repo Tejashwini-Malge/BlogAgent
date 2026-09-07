@@ -43,6 +43,22 @@ _scheduler = None
 @asynccontextmanager
 async def lifespan(app: "FastAPI"):
     global _scheduler
+
+    from src import paths
+    paths.ensure_dirs()
+    print(f"[app] data dir: {paths.DATA_DIR}  output dir: {paths.OUTPUT_DIR}")
+    if paths.is_ephemeral():
+        # Loud, because the failure mode is silent: everything works, and then
+        # a redeploy between the 8:30 draft and the 9:00 approval takes the
+        # post with it and nothing reports a loss.
+        print(
+            "[app] WARNING: running on a platform that rebuilds the code "
+            "directory each deploy, with DATA_DIR unset.\n"
+            "[app]          Pending posts, the topic queue and run records are "
+            "on ephemeral storage and WILL be lost on the next deploy.\n"
+            "[app]          Attach a volume and set DATA_DIR to its mount path."
+        )
+
     enable = os.getenv("ENABLE_INTERNAL_SCHEDULER", "true").strip().lower() == "true"
     if enable:
         try:
@@ -86,6 +102,7 @@ async def generate(
       {"type": "start",        "topic": "..."}
       {"type": "agent_active", "agent": "researcher|writer|editor"}
       {"type": "log",          "agent": "...", "message": "..."}
+      {"type": "grounding",    "level": "grounded|partial|weak|ungrounded", ...}
       {"type": "final",        "content": "...", "saved_to": "..."}
       {"type": "error",        "message": "..."}
       {"type": "done"}
@@ -105,6 +122,7 @@ async def generate(
             from src.crew import run_crew, RunCancelled
             from src.utils import save_output
             from src import pending as pending_store
+            from src import runlog
 
             event_q.put({"type": "start", "topic": topic})
 
@@ -122,7 +140,9 @@ async def generate(
                 print(f"[app] crew cancelled for topic '{topic}'")
                 return
 
-            filepath = save_output(result, topic)
+            content = result.content
+            filepath = save_output(content, topic)
+            runlog.update_record(result.run_id, output_file=str(filepath))
 
             # Manually-triggered generations bypassed the pending store entirely
             # before this — only the scheduler's draft_job wrote to it — so the
@@ -130,14 +150,17 @@ async def generate(
             # every generation here too, regardless of trigger source.
             try:
                 post = pending_store.create_post(
-                    topic, result, tone=tone, length=length,
+                    topic, content, tone=tone, length=length,
                     audience=audience, notes=notes,
+                    grounding=result.grounding, run_id=result.run_id,
                 )
                 pending_store.update_post(post["id"], status="generated", saved_to=filepath)
+                runlog.update_record(result.run_id, post_id=post["id"])
             except Exception as exc:
                 print(f"[app] failed to record post in history: {exc}")
 
-            event_q.put({"type": "final", "content": result, "saved_to": filepath})
+            event_q.put({"type": "final", "content": content, "saved_to": filepath,
+                         "grounding": result.grounding, "run_id": result.run_id})
         except Exception as exc:
             import traceback
             print(f"[app] crew_thread failed for topic '{topic}': {exc!r}")
@@ -390,6 +413,53 @@ async def revise_post(post_id: str, body: ReviseBody):
 
 
 # ── Static frontend ───────────────────────────────────────────────────────────
+
+# ── Scheduler status / control ────────────────────────────────────────────────
+
+@app.get("/api/scheduler")
+async def scheduler_status():
+    """Next run times, last-run outcome per job, and the topic queue."""
+    from src.scheduler_jobs import scheduler_status as status
+    return status()
+
+
+@app.post("/api/scheduler/pause")
+async def scheduler_pause():
+    from src.scheduler_jobs import pause_scheduler, scheduler_status as status
+    if not pause_scheduler():
+        raise HTTPException(status_code=409, detail="Scheduler is not running.")
+    return status()
+
+
+@app.post("/api/scheduler/resume")
+async def scheduler_resume():
+    from src.scheduler_jobs import resume_scheduler, scheduler_status as status
+    if not resume_scheduler():
+        raise HTTPException(status_code=409, detail="Scheduler is not running.")
+    return status()
+
+
+# ── Run records ───────────────────────────────────────────────────────────────
+
+@app.get("/api/runs")
+async def list_runs(limit: int = Query(50, ge=1, le=500)):
+    """
+    Recent run records, newest first. Metrics are omitted here to keep the
+    payload small — fetch a single run for the full record.
+    """
+    from src import runlog
+    return runlog.read_records(limit=limit, include_metrics=False)
+
+
+@app.get("/api/runs/{run_id}")
+async def get_run(run_id: str):
+    """One full run record, including per-agent metrics."""
+    from src import runlog
+    record = runlog.get_record(run_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found.")
+    return record
+
 
 class NoCacheStaticFiles(StaticFiles):
     def is_not_modified(self, response_headers, request_headers) -> bool:

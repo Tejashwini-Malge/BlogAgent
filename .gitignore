@@ -6,3 +6,6 @@ output/
 *.egg-info/
 .pytest_cache/
 dist/
+# Run records are local operational logs, not source.
+data/runs.jsonl
+data/scheduler_state.json
