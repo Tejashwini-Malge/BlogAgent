@@ -1,20 +1,6 @@
 {
   "queue": [
     {
-      "topic": "How AI agents are changing the way we work in 2026",
-      "tone": "conversational",
-      "length": "medium",
-      "audience": "general",
-      "notes": ""
-    },
-    {
-      "topic": "What I learned building a multi-agent system from scratch",
-      "tone": "conversational",
-      "length": "medium",
-      "audience": "general",
-      "notes": "personal experience, storytelling tone"
-    },
-    {
       "topic": "RAG explained simply — and why I was already using it without knowing",
       "tone": "casual",
       "length": "medium",

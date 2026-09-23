@@ -107,6 +107,62 @@ def test_irrelevant_entries_are_dropped_before_ranking(monkeypatch):
     assert "closely enough" in outcome.text
 
 
+# ── named-entity gate ─────────────────────────────────────────────────────────
+# Real incident: a topic naming a specific product ("ChatGPT Astra") matched a
+# generic OpenAI-agents story on ordinary shared words, and that story's real
+# content got attributed to the named product in the finished post. Citation
+# presence proved the URL was real and topical; it proved nothing about
+# whether the article was actually about the thing named in the topic.
+
+def test_entity_tokens_extracts_the_product_name_not_context_acronyms():
+    tokens = tools._entity_tokens("Is ChatGPT Astra dangerous to CSE students")
+    assert tokens == {"chatgpt", "astra"}   # "CSE" excluded: short, likely a field not a product
+
+
+def test_entity_tokens_empty_for_a_generic_topic():
+    assert tools._entity_tokens("how do AI agents work") == set()
+
+
+def test_generic_topic_has_no_identity_gate():
+    """No product named in the query means the gate is a no-op — must not
+    start rejecting results for ordinary topics."""
+    assert tools._mentions_named_entity(set(), "Sourdough starters", "bread")
+
+
+def test_article_naming_the_product_passes_the_gate():
+    entity_tokens = tools._entity_tokens("Is ChatGPT Astra dangerous to CSE students")
+    assert tools._mentions_named_entity(
+        entity_tokens, "OpenAI launches Astra model", "details about the new model")
+
+
+def test_generic_story_sharing_only_ordinary_words_is_rejected():
+    """The exact failure mode: an article about a different OpenAI story,
+    never mentioning the named product, must not pass as being about it."""
+    entity_tokens = tools._entity_tokens("Is ChatGPT Astra dangerous to CSE students")
+    assert not tools._mentions_named_entity(
+        entity_tokens,
+        "Agents identifying as OpenAI systems wrote 17000 wiki posts",
+        "incident details about unsanctioned edits")
+
+
+def test_named_entity_gate_applied_in_fetch_entries(monkeypatch):
+    """End-to-end through _fetch_entries: an entry that clears the generic
+    relevance floor but never names the product must still be dropped."""
+    monkeypatch.setattr(tools.requests, "get", lambda *a, **k: _FakeResponse())
+    monkeypatch.setattr(tools.feedparser, "parse", lambda _: type("P", (), {
+        "entries": [
+            {"title": "Agents identifying as OpenAI systems cause dangerous incident",
+             "summary": "students and researchers reported issues",
+             "link": "https://x.com/wrong-product"},
+        ],
+    })())
+
+    outcome = tools._fetch_entries(
+        "search_news", tools.NEWS_FEEDS, "Is ChatGPT Astra dangerous to CSE students", 5)
+    assert outcome.status == tools.STATUS_EMPTY
+    assert outcome.results == []
+
+
 def test_feeds_that_load_nothing_differ_from_feeds_with_no_match(monkeypatch):
     """'No feed entries available' and 'nothing matched' are different
     diagnoses — one means the feed is broken, the other that the topic isn't
@@ -311,12 +367,46 @@ def test_productive_first_round_does_not_retry(stub_tools):
     stub_tools(_outcome(tools.STATUS_OK, _HIT))
     tool_llm = _ToolLLM([_call("search_news", "q1", "1")])
 
+    # Must actually cite the retrieved URL — a brief with results but no
+    # citation now triggers the retried_uncited_results path (see below),
+    # which this test isn't exercising.
     result = research_agent.run_research_agent(
-        tool_llm, _StubLLM("BRIEF"), "backstory", "prompt")
+        tool_llm, _StubLLM("BRIEF (Source: https://a.com/1)"), "backstory", "prompt")
 
     assert result.retried_empty_search is False
+    assert result.retried_uncited_results is False
     assert result.rounds_used == 1          # the cheap path stays cheap
     assert len(result.tool_calls) == 1
+
+
+def test_uncited_first_round_triggers_a_second_search(stub_tools):
+    """Results came back non-empty but the brief cited none of them (the
+    Astra incident) — must retry exactly like an empty round would."""
+    stub_tools(_outcome(tools.STATUS_OK, _HIT), _outcome(tools.STATUS_OK, _HIT))
+    tool_llm = _ToolLLM([_call("search_news", "narrow phrasing", "1")],
+                        [_call("search_news", "broader phrasing", "2")])
+
+    result = research_agent.run_research_agent(
+        tool_llm, _StubLLM("BRIEF with no citation", "BRIEF (Source: https://a.com/1)"),
+        "backstory", "prompt")
+
+    assert result.retried_uncited_results is True
+    assert result.rounds_used == 2
+    assert "(Source: https://a.com/1)" in result.brief
+
+
+def test_uncited_last_round_ships_anyway(stub_tools):
+    """Out of rounds — must not retry forever; ship whatever the last
+    attempt produced even if it never cited anything."""
+    stub_tools(_outcome(tools.STATUS_OK, _HIT), _outcome(tools.STATUS_OK, _HIT))
+    tool_llm = _ToolLLM([_call("search_news", "q1", "1")],
+                        [_call("search_news", "q2", "2")])
+
+    result = research_agent.run_research_agent(
+        tool_llm, _StubLLM("BRIEF with no citation"), "backstory", "prompt")
+
+    assert result.rounds_used == 2
+    assert result.brief == "BRIEF with no citation"
 
 
 def test_empty_first_round_triggers_a_second_search(stub_tools):
@@ -375,20 +465,20 @@ def _ratio(before_words: int, after_words: int) -> float:
 def test_editor_truncation_threshold_is_below_normal_polish():
     """A polish pass trims a few percent. The threshold has to sit below that
     or every healthy run gets rejected, and above the destructive case."""
-    from src import crew
+    from src import editor_agent
 
-    assert _ratio(1000, 950) > crew.EDITOR_MIN_LENGTH_RATIO   # normal trim: kept
-    assert _ratio(1000, 900) > crew.EDITOR_MIN_LENGTH_RATIO   # 10% trim: kept
+    assert _ratio(1000, 950) > editor_agent.EDITOR_MIN_LENGTH_RATIO   # normal trim: kept
+    assert _ratio(1000, 900) > editor_agent.EDITOR_MIN_LENGTH_RATIO   # 10% trim: kept
     # The real observed failure: 1027 -> 177 words.
-    assert _ratio(1027, 177) < crew.EDITOR_MIN_LENGTH_RATIO
+    assert _ratio(1027, 177) < editor_agent.EDITOR_MIN_LENGTH_RATIO
     # And the two mid-range cases from the same batch.
-    assert _ratio(496, 355) < crew.EDITOR_MIN_LENGTH_RATIO    # -28%
-    assert _ratio(731, 543) < crew.EDITOR_MIN_LENGTH_RATIO    # -26%
+    assert _ratio(496, 355) < editor_agent.EDITOR_MIN_LENGTH_RATIO    # -28%
+    assert _ratio(731, 543) < editor_agent.EDITOR_MIN_LENGTH_RATIO    # -26%
 
 
 def test_editor_lengthening_is_never_treated_as_truncation():
-    from src import crew
-    assert _ratio(654, 796) > crew.EDITOR_MIN_LENGTH_RATIO
+    from src import editor_agent
+    assert _ratio(654, 796) > editor_agent.EDITOR_MIN_LENGTH_RATIO
 
 
 # ── opener scoring: aligned with craft, not against it ────────────────────────

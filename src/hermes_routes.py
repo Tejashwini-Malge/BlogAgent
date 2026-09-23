@@ -3,6 +3,8 @@ Hermes / external trigger routes.
 
 These are synchronous HTTP endpoints that let Hermes Agent (or a curl call)
 trigger the draft and publish jobs on demand — bypassing APScheduler.
+Auth here is Tier C (src/auth.py): a static X-API-Key header, since this is
+explicitly a service-to-service/curl surface, not a browser.
 
 Routes:
   POST /api/jobs/draft    — generate a draft, save as pending, send review email
@@ -11,15 +13,19 @@ Routes:
   GET  /api/posts         — list all posts
 """
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from src.scheduler_jobs import draft_job, publish_job
+from src.job_lock import JobBusyError
+from src.auth import require_api_key, rate_limit
 from src import pending as pending_store
 
-hermes_router = APIRouter(tags=["hermes"])
+hermes_router = APIRouter(tags=["hermes"], dependencies=[Depends(require_api_key)])
 
 
-@hermes_router.post("/api/jobs/draft")
+@hermes_router.post("/api/jobs/draft", dependencies=[
+    Depends(rate_limit("hermes-draft", max_calls=5, window_seconds=60)),
+])
 def trigger_draft():
     """
     Synchronously run the draft job:
@@ -30,7 +36,10 @@ def trigger_draft():
 
     Returns the full post dict including generated content.
     """
-    post = draft_job()
+    try:
+        post = draft_job()
+    except JobBusyError as exc:
+        raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "60"})
     if post is None:
         raise HTTPException(
             status_code=404,
@@ -39,14 +48,19 @@ def trigger_draft():
     return post
 
 
-@hermes_router.post("/api/jobs/publish")
+@hermes_router.post("/api/jobs/publish", dependencies=[
+    Depends(rate_limit("hermes-publish", max_calls=5, window_seconds=60)),
+])
 def trigger_publish():
     """
     Publish all approved posts.
     Posts with status != 'approved' are skipped (boss rule: silence never publishes).
     Returns a summary of published / skipped / errored posts.
     """
-    return publish_job()
+    try:
+        return publish_job()
+    except JobBusyError as exc:
+        raise HTTPException(status_code=429, detail=str(exc), headers={"Retry-After": "60"})
 
 
 @hermes_router.get("/api/posts/{post_id}")

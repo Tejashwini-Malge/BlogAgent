@@ -149,6 +149,51 @@ def _is_relevant(query_tokens: set, matched: int) -> bool:
     return matched >= min(_MIN_MATCHED_TOKENS, len(query_tokens))
 
 
+# A query like "Is ChatGPT Astra dangerous to CSE students" can clear
+# _MIN_MATCHED_TOKENS against an article that shares two ordinary words
+# ("dangerous", "students") without ever mentioning "Astra" at all — a
+# generic story about AI agents in general, cited as if it were specifically
+# about the named product. Real incident this guards against: exactly that
+# article got cited, and its actual content (a different OpenAI story) got
+# attributed to "Astra" in the finished post. Generic topical overlap and
+# "is this actually about the named thing" are different questions;
+# _MIN_MATCHED_TOKENS only ever answered the first one.
+def _entity_tokens(query: str) -> set:
+    """
+    Stemmed tokens of the query's apparent product/entity names: words
+    capitalized mid-sentence (skips the sentence-initial word, whose
+    capitalization is grammar, not a signal), plus acronyms longer than 4
+    characters (short acronyms like "CSE"/"AI"/"API" are usually a field or
+    context, not the specific thing being asked about, and requiring them
+    to appear verbatim in real coverage of the product itself would reject
+    genuinely relevant sources for no reason).
+    """
+    words = re.findall(r"[A-Za-z0-9']+", query)
+    anchors = []
+    for i, w in enumerate(words):
+        if len(w) <= 2:
+            continue
+        is_acronym = w.isupper()
+        is_capitalized = w[0].isupper() and not is_acronym
+        if i == 0 and not is_acronym:
+            continue
+        if is_capitalized or (is_acronym and len(w) > 4):
+            anchors.append(w)
+    return {craft.stem(w) for w in anchors}
+
+
+def _mentions_named_entity(entity_tokens: set, title: str, summary: str) -> bool:
+    """
+    Hard gate: if the topic names a specific product/entity, a result must
+    mention at least one of those names to count as being about it — not
+    just the general subject area. No entity names in the query (a generic
+    topic like "how do AI agents work") means this is a no-op.
+    """
+    if not entity_tokens:
+        return True
+    return bool(entity_tokens & (craft.content_tokens(title) | craft.content_tokens(summary)))
+
+
 def _truncate(body: str) -> str:
     if len(body) > _SNIPPET_LEN:
         return body[:_SNIPPET_LEN].rsplit(" ", 1)[0] + "…"
@@ -164,7 +209,8 @@ def _fetch_entries(tool_name: str, feeds, query: str, max_results: int) -> ToolO
     started = time.monotonic()
     outcome = ToolOutcome(tool=tool_name, query=query)
 
-    query_tokens = craft.content_tokens(query)
+    query_tokens  = craft.content_tokens(query)
+    entity_tokens = _entity_tokens(query)
     scored = []
     errors = []
     entries_seen = 0   # feeds that parsed, before the relevance floor
@@ -183,6 +229,8 @@ def _fetch_entries(tool_name: str, feeds, query: str, max_results: int) -> ToolO
             score   = _score(query_tokens, title, summary)
             matched = _matched_tokens(query_tokens, title, summary)
             if not _is_relevant(query_tokens, matched):
+                continue
+            if not _mentions_named_entity(entity_tokens, title, summary):
                 continue
             scored.append((score, source_name, title, summary, link))
 
@@ -265,6 +313,7 @@ def _ddgs_search(tool_name: str, query: str, full_query: str) -> ToolOutcome:
         outcome.elapsed_ms = int((time.monotonic() - started) * 1000)
         return outcome
 
+    entity_tokens = _entity_tokens(query)
     lines, seen = [], set()
     for r in results:
         title = (r.get("title") or "").strip()
@@ -272,9 +321,22 @@ def _ddgs_search(tool_name: str, query: str, full_query: str) -> ToolOutcome:
         url   = r.get("url") or r.get("href") or ""
         if url and url in seen:
             continue
+        if not _mentions_named_entity(entity_tokens, title, body):
+            continue
         seen.add(url)
         outcome.results.append({"source": title, "title": title, "url": url})
         lines.append(f"- {title}\n  {_truncate(body)}\n  Source: {url}")
+
+    if not lines:
+        # Same distinction as the RSS path: results came back, but none
+        # actually named the specific product/entity the query was about —
+        # a real answer ("nothing here is actually about that"), not a
+        # failure, and safer than citing a generic story about the same
+        # subject area as if it were about the named thing.
+        outcome.status = STATUS_EMPTY
+        outcome.text = "Results came back but none mentioned the specific product/entity named in the query."
+        outcome.elapsed_ms = int((time.monotonic() - started) * 1000)
+        return outcome
 
     outcome.status = STATUS_OK
     outcome.text = "\n".join(lines)

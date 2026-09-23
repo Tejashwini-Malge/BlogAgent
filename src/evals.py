@@ -76,7 +76,7 @@ def run_eval(
     running them concurrently would produce 429s that the retry layer papers
     over — turning a latency measurement into a measurement of the retry layer.
     """
-    from src.crew import run_crew, RunCancelled   # deferred: pulls in the LLM stack
+    from src.services.workflow import run_crew, RunCancelled   # deferred: pulls in the LLM stack
 
     topics = topics if topics is not None else load_topics()
     eval_id = new_eval_id(tag)

@@ -9,3 +9,5 @@ dist/
 # Run records are local operational logs, not source.
 data/runs.jsonl
 data/scheduler_state.json
+# User accounts DB (password hashes, sessions) — local state, not source.
+data/blogagent.db

@@ -35,9 +35,10 @@ from src import pending as pending_store
 from src import emailer
 from src import publishers
 from src.voice import get_voice_context
-from src.crew import run_crew
+from src.services.workflow import run_crew
 from src.utils import save_output
 from src import runlog
+from src import job_lock
 
 _TOPICS_FILE = data_file("topics.json")
 _topics_lock = threading.Lock()
@@ -235,7 +236,17 @@ def draft_job() -> dict | None:
     Claim a topic, run the crew, save as pending post, send review email.
     Returns the created post dict, or None if the queue is empty or the run
     failed. A failed run leaves the topic in the queue for the next attempt.
+
+    Guarded by job_lock so a Hermes-triggered draft and a cron-triggered
+    draft can't run concurrently — APScheduler's own max_instances=1 only
+    protects against overlapping cron fires, not this. Raises
+    job_lock.JobBusyError on contention; callers map that to HTTP 429.
     """
+    with job_lock.guard("draft"):
+        return _draft_job_body()
+
+
+def _draft_job_body() -> dict | None:
     topic_item = claim_topic()
     if not topic_item:
         print("[scheduler] draft_job: no topic available — nothing to draft.")
@@ -321,7 +332,9 @@ def draft_job() -> dict | None:
     # is where a human decides to publish — an ungrounded post has to announce
     # itself there or the label may as well not exist.
     try:
-        emailer.send_review_email(post["id"], topic, content, grounding=grounding)
+        emailer.send_review_email(
+            post["id"], topic, content, post["review_token"], grounding=grounding,
+        )
     except Exception as exc:
         print(f"[scheduler] draft_job: email failed — {exc}")
 
@@ -342,7 +355,15 @@ def publish_job() -> dict:
     """
     Publish all approved posts. Send skipped-notice for still-pending ones.
     Returns a results dict.
+
+    Guarded by job_lock — see draft_job's docstring for why. Raises
+    job_lock.JobBusyError on contention; callers map that to HTTP 429.
     """
+    with job_lock.guard("publish"):
+        return _publish_job_body()
+
+
+def _publish_job_body() -> dict:
     approved = pending_store.approved_posts()
     still_pending = pending_store.pending_posts()
 
@@ -402,7 +423,7 @@ def publish_job() -> dict:
     # Notify for posts that were never approved
     for post in still_pending:
         try:
-            emailer.send_skipped_email(post["id"], post["topic"])
+            emailer.send_skipped_email(post["id"], post["topic"], post.get("review_token", ""))
         except Exception as exc:
             print(f"[scheduler] publish_job: skipped email failed — {exc}")
         results["skipped"].append({"id": post["id"], "topic": post["topic"]})

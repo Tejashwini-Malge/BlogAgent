@@ -935,7 +935,7 @@ document.addEventListener('keydown', e => {
 });
 
 function fetchHistoryCount() {
-  fetch('/api/posts').then(r => r.ok ? r.json() : []).then(posts => {
+  fetch('/api/my-posts').then(r => r.ok ? r.json() : []).then(posts => {
     if (historyBadge) historyBadge.textContent = posts.length || '0';
   }).catch(() => {});
 }
@@ -944,7 +944,7 @@ function fetchHistory() {
   if (!drawerBody) return;
   drawerBody.innerHTML = '<div class="drawer-empty">Loading…</div>';
 
-  fetch('/api/posts')
+  fetch('/api/my-posts')
     .then(r => r.ok ? r.json() : [])
     .then(posts => {
       if (historyBadge) historyBadge.textContent = posts.length || '0';
@@ -986,8 +986,7 @@ function buildHistoryCard(post) {
     clearTypewriterTimer();
     currentResult = post.content;
     currentTopic  = post.topic || '';
-    const html = window.marked ? marked.parse(currentResult) : `<pre>${escapeHtml(currentResult)}</pre>`;
-    proseContent.innerHTML = html;
+    proseContent.innerHTML = renderMarkdownSafe(currentResult);
     rawTextarea.value = currentResult;
     const words = currentResult.trim().split(/\s+/).filter(Boolean).length;
     wordCount.textContent = `~${words} words`;
@@ -1042,6 +1041,20 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
   ));
+}
+
+/* Blog content is LLM-generated, and the research agent does live web
+   search — an executable payload echoed back from a scraped source (or a
+   successful prompt injection) would otherwise flow straight through
+   marked.parse() into innerHTML. DOMPurify sanitizes the rendered HTML
+   before it's ever assigned. If either library failed to load (CDN outage,
+   SRI mismatch), fail safe to escaped plain text rather than skip
+   sanitization silently. */
+function renderMarkdownSafe(markdownText) {
+  if (!window.marked || !window.DOMPurify) {
+    return `<pre>${escapeHtml(markdownText)}</pre>`;
+  }
+  return DOMPurify.sanitize(marked.parse(markdownText));
 }
 
 /* ── Grounding badge ────────────────────────────────────────────────────── */
@@ -1176,7 +1189,7 @@ function handleEvent(raw) {
       requestAnimationFrame(positionIndicator);
       setTimeout(() => resultSection.scrollIntoView({ behavior: 'smooth', block: 'start' }), 80);
 
-      const html = window.marked ? marked.parse(currentResult) : `<pre>${escapeHtml(currentResult)}</pre>`;
+      const html = renderMarkdownSafe(currentResult);
 
       /* Small delay so scroll settles before the typing starts */
       setTimeout(() => {
