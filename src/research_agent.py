@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 
 from src.tools import TOOL_IMPLS, ToolOutcome, STATUS_ERROR
+from src.citation_guard import extract_cited_urls
+from src import craft
 
 # Two rounds, but the second is CONDITIONAL — it only happens when the first
 # round retrieved nothing usable (every search errored or matched nothing).
@@ -78,6 +80,7 @@ class ResearchResult:
     fell_back_toolless: bool = False   # tool-calling itself failed; plain pass instead
     called_no_tools: bool = False      # model answered directly without searching
     retried_empty_search: bool = False # first round found nothing; searched again
+    retried_uncited_results: bool = False # first round found results but cited none; searched again
 
     @property
     def retrieved_urls(self) -> list:
@@ -96,6 +99,7 @@ class ResearchResult:
             "called_no_tools": self.called_no_tools,
             "fell_back_toolless": self.fell_back_toolless,
             "retried_empty_search": self.retried_empty_search,
+            "retried_uncited_results": self.retried_uncited_results,
             "tool_calls": [o.as_record() for o in self.tool_calls],
             "sources_retrieved": len(self.retrieved_urls),
         }
@@ -157,6 +161,44 @@ def _run_tool_calls(tool_calls: list) -> list:
     finally:
         pool.shutdown(wait=False)
     return outcomes
+
+
+def _write_final_brief(backstory: str, prompt: str, plain_llm, gathered: list, retrieved_urls: list) -> str:
+    """
+    Rebuilt as a clean toolless conversation (system + original prompt +
+    findings as text) rather than replaying the tool-call message history,
+    which a toolless request isn't allowed to contain.
+    """
+    findings = "\n\n".join(gathered).strip()
+    if findings:
+        # "cite where relevant" let the model cite nothing at all. Observed
+        # directly: three sources retrieved, zero carried into the brief,
+        # which empties allowed_domains and strips every citation from the
+        # finished post — a fully ungrounded article that looks clean. The
+        # URLs are listed explicitly and the requirement is made
+        # unconditional, because everything downstream can only cite what
+        # this brief already contains.
+        available = "\n".join(f"- {u}" for u in retrieved_urls)
+        final_prompt = (
+            f"{prompt}\n\nHere is what your searches returned:\n\n{findings}\n\n"
+            "Stop searching now and write the final Markdown brief from these "
+            "results.\n\nCITATIONS (required):\n"
+            "- Every claim you took from the results above MUST carry its source "
+            "inline as (Source: <url>), copied verbatim from this list:\n"
+            f"{available}\n"
+            "- Use at least one of these URLs. They are the only sources anything "
+            "downstream is permitted to cite — a claim you leave uncited here can "
+            "never be attributed later.\n"
+            "- Do not cite any URL that is not on this list, and do not invent one.\n"
+            f"{craft.SPECIFICS_CONTRACT}"
+        )
+    else:
+        final_prompt = prompt
+    final = plain_llm.invoke([
+        SystemMessage(content=backstory),
+        HumanMessage(content=final_prompt),
+    ])
+    return final.content.strip()
 
 
 def run_research_agent(
@@ -229,52 +271,37 @@ def run_research_agent(
                     outcome.tool, outcome.query, outcome.text,
                 ))
 
-            # Anything retrieved at all? Then stop searching and write the
-            # brief — the retry exists for empty rounds, not for topping up a
-            # round that already worked.
-            if any(o.results for o in outcomes):
-                break
-
             rounds_left = MAX_TOOL_ITERS - result.rounds_used
-            if rounds_left > 0:
-                emit({"type": "log", "agent": "researcher",
-                      "message": "Searches came back empty — retrying with different terms…"})
-                messages.append(HumanMessage(content=_RETRY_NUDGE))
-                result.retried_empty_search = True
 
-        # Used up the one decision round — force a final answer, no more tool
-        # calls. Rebuilt as a clean toolless conversation (system + original
-        # prompt + findings as text) rather than replaying `messages`, which
-        # carries tool calls a toolless request isn't allowed to contain.
-        findings = "\n\n".join(gathered).strip()
-        if findings:
-            # "cite where relevant" let the model cite nothing at all. Observed
-            # directly: three sources retrieved, zero carried into the brief,
-            # which empties allowed_domains and strips every citation from the
-            # finished post — a fully ungrounded article that looks clean. The
-            # URLs are listed explicitly and the requirement is made
-            # unconditional, because everything downstream can only cite what
-            # this brief already contains.
-            available = "\n".join(f"- {u}" for u in result.retrieved_urls)
-            final_prompt = (
-                f"{prompt}\n\nHere is what your searches returned:\n\n{findings}\n\n"
-                "Stop searching now and write the final Markdown brief from these "
-                "results.\n\nCITATIONS (required):\n"
-                "- Every claim you took from the results above MUST carry its source "
-                "inline as (Source: <url>), copied verbatim from this list:\n"
-                f"{available}\n"
-                "- Use at least one of these URLs. They are the only sources anything "
-                "downstream is permitted to cite — a claim you leave uncited here can "
-                "never be attributed later.\n"
-                "- Do not cite any URL that is not on this list, and do not invent one."
-            )
-        else:
-            final_prompt = prompt
-        final = plain_llm.invoke([
-            SystemMessage(content=backstory),
-            HumanMessage(content=final_prompt),
-        ])
-        result.brief = final.content.strip()
+            if not any(o.results for o in outcomes):
+                if rounds_left > 0:
+                    emit({"type": "log", "agent": "researcher",
+                          "message": "Searches came back empty — retrying with different terms…"})
+                    messages.append(HumanMessage(content=_RETRY_NUDGE))
+                    result.retried_empty_search = True
+                    continue
+                break  # exhausted with nothing at all — fall through to the final answer below
+
+            # Retrieved something — write a candidate brief and check whether
+            # it actually cited any of it. Real incident this guards against:
+            # results came back non-empty but irrelevant enough that the model
+            # cited none of them, then filled the brief with confident,
+            # uncited detail from its own training data instead — grounding
+            # still read as "results retrieved" even though nothing in the
+            # brief was actually backed by them.
+            brief = _write_final_brief(backstory, prompt, plain_llm, gathered, result.retrieved_urls)
+            if extract_cited_urls(brief) or rounds_left == 0:
+                result.brief = brief
+                return result
+
+            emit({"type": "log", "agent": "researcher",
+                  "message": "Results didn't fit the topic closely enough to cite — "
+                             "retrying with different terms…"})
+            messages.append(HumanMessage(content=_RETRY_NUDGE))
+            result.retried_uncited_results = True
+
+        # Used up both rounds with no citable results at all.
+        result.brief = _write_final_brief(backstory, prompt, plain_llm, gathered, result.retrieved_urls)
         return result
 
     except Exception as exc:

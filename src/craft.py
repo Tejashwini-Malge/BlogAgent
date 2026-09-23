@@ -333,7 +333,61 @@ settled, and do not both-sides it into mush: say what you think holds up.
 {tension}
 """
 
-# Added to the research prompt so the tension exists before the writer needs it.
+# Injected when the research phase retrieved sources but couldn't cite any of
+# them (grounding_level "weak") or found nothing at all ("ungrounded"). Real
+# incident this exists for: a topic about a product the model had no verified
+# information on produced a confident, specific, and entirely fabricated
+# "Model Overview" section (invented capabilities, an invented claim about
+# "unsanctioned wiki edits") with zero citations — grounding was correctly
+# labeled "weak" in the run record, but nothing stopped the prose itself from
+# reading as fact. This contract targets the actual failure: the model
+# filling gaps with confident invention instead of admitting it doesn't know.
+UNVERIFIED_CONTRACT = """
+UNVERIFIED TOPIC — WRITE ACCORDINGLY:
+The research brief below could not be backed by real, cited sources for this
+topic. Do not invent specifics to compensate — a name, a capability, a
+statistic, or an anecdote that sounds plausible is still fabrication if it
+isn't in the brief.
+- Open by stating plainly that this topic could not be verified against
+  real sources, in your own words — do not skip this.
+- Every specific claim (a number, a named feature, an attributed quote, a
+  described incident) must either come from the brief or be explicitly
+  marked as general/unverified (e.g. "generally understood to..." /
+  "unconfirmed, but..."). If you don't have a real basis for a specific
+  detail, say so or leave it out — do not fill the gap with something
+  that merely sounds right.
+- It is fine, and often better, for a section to be shorter and hedged than
+  to be full-length and confident about things nobody verified.
+"""
+
+# Unconditional — applies even when grounding is "grounded", unlike
+# UNVERIFIED_CONTRACT above. Real incident: a topic where the researcher DID
+# retrieve and cite real articles still produced a wrong base-model name, a
+# wrong year for a real event, and a real incident misattributed to the
+# wrong product — because the search tools only ever hand the model a title
+# + ~240-char snippet (src/tools.py's _SNIPPET_LEN), nowhere near enough
+# material to support a full section of specific claims. The model has a
+# real, relevant citation and still has to invent most of the supporting
+# detail from memory. Citing a URL proves the topic is real and relevant; it
+# proves nothing about whether a specific number, date, or name attached to
+# it is the one the source actually said.
+SPECIFICS_CONTRACT = """
+SPECIFIC CLAIMS (strict, applies regardless of how well-sourced this topic is):
+A citation next to a claim does not make that claim verified — the search
+results you have are short snippets, not full articles, and cannot support
+every specific detail you might be tempted to add.
+- A precise number, date, version/model name, or a described incident may
+  only be stated as fact if it is actually present in the search results
+  above (or, for the writer, in the research brief). If you want to include
+  such a detail and it isn't there, either leave it out or mark it clearly
+  as general/unconfirmed (e.g. "reportedly", "unconfirmed reports suggest")
+  rather than stating it as settled fact.
+- This applies even to things you're confident you know from general
+  knowledge — if a specific number or date isn't in the material you were
+  actually given, treat it as unverified for this piece, not as something
+  you can fill in from memory.
+"""
+
 TENSION_RESEARCH_CLAUSE = """\
 - A section headed exactly "Where people disagree" covering the genuine points
   of contention: competing approaches, unresolved debates, or claims that

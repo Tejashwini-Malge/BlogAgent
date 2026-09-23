@@ -23,12 +23,18 @@ for _stream in (sys.stdout, sys.stderr):
             pass
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Query, Request, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, Query, Request, HTTPException, Depends
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.types import Scope
 from sse_starlette.sse import EventSourceResponse
+
+from src.auth import (
+    require_user_api, require_user_page, require_review_token, rate_limit,
+    check_secrets_configured, RedirectToLogin,
+)
+from src import job_lock
 
 load_dotenv(override=True)
 
@@ -43,6 +49,13 @@ _scheduler = None
 @asynccontextmanager
 async def lifespan(app: "FastAPI"):
     global _scheduler
+
+    # Fail closed: refuse to serve a single request rather than silently run
+    # every route unauthenticated because a secret was left unset.
+    check_secrets_configured()
+
+    from src.db import init_db
+    init_db()
 
     from src import paths
     paths.ensure_dirs()
@@ -75,15 +88,26 @@ async def lifespan(app: "FastAPI"):
 
 app = FastAPI(title="Blog Agent", lifespan=lifespan)
 
-# ── Include Hermes routes ─────────────────────────────────────────────────────
+
+@app.exception_handler(RedirectToLogin)
+async def _redirect_to_login(request: Request, exc: RedirectToLogin):
+    return RedirectResponse(url="/login", status_code=303)
+
+
+# ── Include Hermes + auth routes ──────────────────────────────────────────────
 
 from src.hermes_routes import hermes_router
 app.include_router(hermes_router)
 
+from src.auth_routes import auth_router
+app.include_router(auth_router)
+
 
 # ── SSE generation endpoint ───────────────────────────────────────────────────
 
-@app.get("/api/generate")
+@app.get("/api/generate", dependencies=[
+    Depends(rate_limit("generate", max_calls=5, window_seconds=60)),
+])
 async def generate(
     request: Request,
     topic:    str = Query(..., min_length=3, max_length=200),
@@ -92,7 +116,9 @@ async def generate(
     audience: str = Query("general"),
     notes:    str = Query(""),
     critique_rounds: int = Query(0, ge=0, le=2),
+    current_user: dict = Depends(require_user_api),
 ):
+    user_id = current_user["id"]
     """
     Streams Server-Sent Events while the crew writes the blog post.
     Notes are automatically wrapped with the user's voice profile before
@@ -107,6 +133,16 @@ async def generate(
       {"type": "error",        "message": "..."}
       {"type": "done"}
     """
+    # Same "draft" lock draft_job()/hermes's /api/jobs/draft use — a manual
+    # generation and a scheduled/Hermes draft are the same class of
+    # expensive, side-effecting work and shouldn't run concurrently.
+    if not job_lock.try_acquire("draft"):
+        raise HTTPException(
+            status_code=429,
+            detail="A draft is already being generated. Try again shortly.",
+            headers={"Retry-After": "60"},
+        )
+
     # Inject voice profile into notes
     try:
         from src.voice import get_voice_context
@@ -119,7 +155,7 @@ async def generate(
 
     def crew_thread():
         try:
-            from src.crew import run_crew, RunCancelled
+            from src.services.workflow import run_crew, RunCancelled
             from src.utils import save_output
             from src import pending as pending_store
             from src import runlog
@@ -153,6 +189,7 @@ async def generate(
                     topic, content, tone=tone, length=length,
                     audience=audience, notes=notes,
                     grounding=result.grounding, run_id=result.run_id,
+                    user_id=user_id,
                 )
                 pending_store.update_post(post["id"], status="generated", saved_to=filepath)
                 runlog.update_record(result.run_id, post_id=post["id"])
@@ -168,6 +205,7 @@ async def generate(
             event_q.put({"type": "error", "message": str(exc) or repr(exc)})
         finally:
             event_q.put(None)  # sentinel
+            job_lock.release("draft")
 
     threading.Thread(target=crew_thread, daemon=True).start()
 
@@ -219,14 +257,8 @@ class ReviseBody(BaseModel):
 
 
 @app.get("/review/{post_id}", response_class=HTMLResponse)
-async def review_page(post_id: str):
+async def review_page(post_id: str, post: dict = Depends(require_review_token)):
     """Dark-themed review page: shows draft + approve / revise / skip buttons."""
-    from src import pending as pending_store
-
-    post = pending_store.get_post(post_id)
-    if post is None:
-        raise HTTPException(status_code=404, detail="Post not found.")
-
     base_url   = os.getenv("APP_BASE_URL", "http://localhost:8000")
     status     = post.get("status", "pending")
     topic      = html.escape(post.get("topic", ""))
@@ -240,6 +272,26 @@ async def review_page(post_id: str):
         "published": "#7C3AED",
         "failed":    "#EF4444",
     }.get(status, "#7B769A")
+
+    # Grounding was previously only shown in the review email (easy to miss)
+    # and a log line during generation (gone by review time) — nothing stopped
+    # a "weak"/"ungrounded" post's confidently-worded content from being
+    # approved without the reviewer ever seeing that warning. This banner is
+    # the last checkpoint before Approve, so it sits directly above the draft,
+    # not buried below it.
+    grounding = post.get("grounding") or {}
+    grounding_level = grounding.get("level")
+    grounding_banner_html = ""
+    if grounding_level in ("weak", "ungrounded"):
+        heading = ("NOT GROUNDED — no real sources back this content" if grounding_level == "ungrounded"
+                   else "WEAKLY GROUNDED — sources were found but not cited")
+        grounding_banner_html = f"""
+  <div class="grounding-warn">
+    <div class="grounding-warn__title">&#9888; {html.escape(heading)}</div>
+    <div class="grounding-warn__body">{html.escape(grounding.get("reason", ""))}</div>
+    <div class="grounding-warn__note">Read every specific claim below before approving — the model may have
+      filled gaps with plausible-sounding but unverified detail.</div>
+  </div>"""
 
     page = f"""<!DOCTYPE html>
 <html lang="en">
@@ -279,13 +331,20 @@ async def review_page(post_id: str):
     .btn-revise  {{ background: #7C3AED; color: #fff; }}
     .btn-skip    {{ background: #EF4444; color: #fff; }}
     #msg {{ margin-top: 1rem; font-size: .82rem; color: #22D473; min-height: 1.2rem; }}
+    .grounding-warn {{
+      background: #3B1F1F; border: 1px solid #D97026; border-left: 5px solid #D97026;
+      border-radius: 10px; padding: 16px 18px; margin-bottom: 1.5rem;
+    }}
+    .grounding-warn__title {{ font-weight: 700; color: #F0A868; font-size: .92rem; margin-bottom: .4rem; }}
+    .grounding-warn__body  {{ color: #E4C9B8; font-size: .84rem; line-height: 1.5; }}
+    .grounding-warn__note  {{ color: #B89C8C; font-size: .78rem; margin-top: .5rem; }}
   </style>
 </head>
 <body>
 <div class="wrap">
   <h1>{topic} <span class="badge">{html.escape(status)}</span></h1>
   <div class="meta">Created {created} &nbsp;·&nbsp; ID: {html.escape(post_id)}</div>
-
+  {grounding_banner_html}
   <div class="card">
     <div class="draft">{content_md}</div>
   </div>
@@ -304,8 +363,9 @@ async def review_page(post_id: str):
 </div>
 
 <script>
-const BASE = "{html.escape(base_url)}";
-const ID   = "{html.escape(post_id)}";
+const BASE  = "{html.escape(base_url)}";
+const ID    = "{html.escape(post_id)}";
+const TOKEN = "{html.escape(post.get('review_token', ''))}";
 
 async function act(action) {{
   const msg = document.getElementById('msg');
@@ -321,7 +381,7 @@ async function act(action) {{
   msg.textContent = action === 'revise' ? 'Applying corrections… (this may take a minute)' : 'Saving…';
 
   try {{
-    let url  = `${{BASE}}/api/posts/${{ID}}/${{action}}`;
+    let url  = `${{BASE}}/api/posts/${{ID}}/${{action}}?t=${{encodeURIComponent(TOKEN)}}`;
     let body = action === 'revise' ? JSON.stringify({{ corrections }}) : null;
 
     const res = await fetch(url, {{
@@ -351,22 +411,27 @@ async function act(action) {{
     return HTMLResponse(content=page)
 
 
-@app.post("/api/posts/{post_id}/approve")
-async def approve_post(post_id: str):
+@app.post("/api/posts/{post_id}/approve", dependencies=[
+    Depends(rate_limit("posts-action", max_calls=20, window_seconds=60)),
+])
+async def approve_post(post_id: str, _post: dict = Depends(require_review_token)):
     from src import pending as pending_store
     from datetime import datetime, timezone
     post = pending_store.update_post(
         post_id,
         status="approved",
         approved_at=datetime.now(timezone.utc).isoformat(),
+        approved_by="review-link",
     )
     if post is None:
         raise HTTPException(status_code=404, detail="Post not found.")
     return {"status": "approved", "id": post_id}
 
 
-@app.post("/api/posts/{post_id}/skip")
-async def skip_post(post_id: str):
+@app.post("/api/posts/{post_id}/skip", dependencies=[
+    Depends(rate_limit("posts-action", max_calls=20, window_seconds=60)),
+])
+async def skip_post(post_id: str, _post: dict = Depends(require_review_token)):
     from src import pending as pending_store
     post = pending_store.update_post(post_id, status="skipped")
     if post is None:
@@ -374,15 +439,13 @@ async def skip_post(post_id: str):
     return {"status": "skipped", "id": post_id}
 
 
-@app.post("/api/posts/{post_id}/revise")
-async def revise_post(post_id: str, body: ReviseBody):
+@app.post("/api/posts/{post_id}/revise", dependencies=[
+    Depends(rate_limit("posts-action", max_calls=20, window_seconds=60)),
+])
+async def revise_post(post_id: str, body: ReviseBody, post: dict = Depends(require_review_token)):
     from src import pending as pending_store
     from src import publishers, emailer
     from src.voice import record_correction
-
-    post = pending_store.get_post(post_id)
-    if post is None:
-        raise HTTPException(status_code=404, detail="Post not found.")
 
     original_content = post.get("content", "")
     corrections      = body.corrections.strip()
@@ -405,7 +468,7 @@ async def revise_post(post_id: str, body: ReviseBody):
 
     # Re-send review email with the revised draft
     try:
-        emailer.send_review_email(post_id, post.get("topic", ""), revised)
+        emailer.send_review_email(post_id, post.get("topic", ""), revised, post.get("review_token", ""))
     except Exception as exc:
         print(f"[app] revise: email failed — {exc}")
 
@@ -416,14 +479,14 @@ async def revise_post(post_id: str, body: ReviseBody):
 
 # ── Scheduler status / control ────────────────────────────────────────────────
 
-@app.get("/api/scheduler")
+@app.get("/api/scheduler", dependencies=[Depends(require_user_api)])
 async def scheduler_status():
     """Next run times, last-run outcome per job, and the topic queue."""
     from src.scheduler_jobs import scheduler_status as status
     return status()
 
 
-@app.post("/api/scheduler/pause")
+@app.post("/api/scheduler/pause", dependencies=[Depends(require_user_api)])
 async def scheduler_pause():
     from src.scheduler_jobs import pause_scheduler, scheduler_status as status
     if not pause_scheduler():
@@ -431,7 +494,7 @@ async def scheduler_pause():
     return status()
 
 
-@app.post("/api/scheduler/resume")
+@app.post("/api/scheduler/resume", dependencies=[Depends(require_user_api)])
 async def scheduler_resume():
     from src.scheduler_jobs import resume_scheduler, scheduler_status as status
     if not resume_scheduler():
@@ -441,7 +504,7 @@ async def scheduler_resume():
 
 # ── Run records ───────────────────────────────────────────────────────────────
 
-@app.get("/api/runs")
+@app.get("/api/runs", dependencies=[Depends(require_user_api)])
 async def list_runs(limit: int = Query(50, ge=1, le=500)):
     """
     Recent run records, newest first. Metrics are omitted here to keep the
@@ -451,7 +514,7 @@ async def list_runs(limit: int = Query(50, ge=1, le=500)):
     return runlog.read_records(limit=limit, include_metrics=False)
 
 
-@app.get("/api/runs/{run_id}")
+@app.get("/api/runs/{run_id}", dependencies=[Depends(require_user_api)])
 async def get_run(run_id: str):
     """One full run record, including per-agent metrics."""
     from src import runlog
@@ -473,12 +536,20 @@ class NoCacheStaticFiles(StaticFiles):
         return response
 
 
-@app.get("/")
+@app.get("/", dependencies=[Depends(require_user_page)])
 async def root():
     return FileResponse(
         FRONTEND_DIR / "index.html",
         headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
     )
+
+
+@app.get("/api/my-posts")
+async def my_posts(current_user: dict = Depends(require_user_api)):
+    """Posts owned by the logged-in account — what the history drawer reads.
+    (Not /api/posts — that's the Hermes/API-key route and stays global.)"""
+    from src import pending as pending_store
+    return pending_store.posts_for_user(current_user["id"])
 
 
 @app.get("/favicon.ico")
@@ -488,4 +559,11 @@ async def favicon():
     return Response(status_code=204)
 
 
+# Deliberately left unauthenticated: this serves only the SPA's own JS/CSS/
+# HTML assets (no secrets embedded — verified, none of the app's env-var
+# secrets appear in frontend/*.js), and `app.mount()` doesn't compose with
+# FastAPI's `dependencies=` the way a route decorator does. The page these
+# assets render (`/`) and every API call they make are already gated by
+# require_user_page/require_user_api — reading the client bundle itself
+# isn't a hole.
 app.mount("/static", NoCacheStaticFiles(directory=str(FRONTEND_DIR)), name="static")

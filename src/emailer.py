@@ -122,26 +122,31 @@ def _grounding_banner(grounding: dict | None) -> str:
     )
 
 
-def send_review_email(post_id: str, topic: str, draft: str,
+def send_review_email(post_id: str, topic: str, draft: str, token: str,
                       grounding: dict | None = None) -> None:
     """
     Sent at 8:30 AM after a draft is generated.
     Contains the full draft + approve / revise / skip action buttons.
+
+    `token` is the post's review_token (src/pending.py) — appended as `?t=`
+    so the link stays one-tap-from-a-phone (src/auth.py's Tier B) without
+    requiring a login.
     """
     cfg = _cfg()
     review_url = f"{cfg['base_url']}/review/{post_id}"
+    token_qs = f"?t={token}"
 
     body = f"""
     <div class="sub">Blog draft ready for review</div>
     {_grounding_banner(grounding)}
     <p><strong>Topic:</strong> {html.escape(topic)}</p>
     <p>
-      <a href="{html.escape(review_url)}/approve" class="btn btn-approve">Approve</a>
-      <a href="{html.escape(review_url)}" class="btn btn-revise">Review &amp; Revise</a>
-      <a href="{html.escape(review_url)}/skip" class="btn btn-skip">Skip</a>
+      <a href="{html.escape(review_url + '/approve' + token_qs)}" class="btn btn-approve">Approve</a>
+      <a href="{html.escape(review_url + token_qs)}" class="btn btn-revise">Review &amp; Revise</a>
+      <a href="{html.escape(review_url + '/skip' + token_qs)}" class="btn btn-skip">Skip</a>
     </p>
     <div class="prose">{html.escape(draft)}</div>
-    <p><a href="{html.escape(review_url)}" style="color:#A78BFA;">Open full review page →</a></p>
+    <p><a href="{html.escape(review_url + token_qs)}" style="color:#A78BFA;">Open full review page →</a></p>
     """
     _send(f"[Blog Agent] Review: {topic}", _base_template(f"Review: {topic}", body))
 
@@ -167,10 +172,10 @@ def send_published_email(post_id: str, topic: str, linkedin_url: str, medium_md:
     _send(f"[Blog Agent] Published: {topic}", _base_template(f"Published: {topic}", body))
 
 
-def send_skipped_email(post_id: str, topic: str) -> None:
+def send_skipped_email(post_id: str, topic: str, token: str) -> None:
     """Sent when a draft was never approved before the publish window."""
     cfg = _cfg()
-    review_url = f"{cfg['base_url']}/review/{post_id}"
+    review_url = f"{cfg['base_url']}/review/{post_id}?t={token}"
     body = f"""
     <div class="sub">Draft skipped — not published</div>
     <p><strong>Topic:</strong> {html.escape(topic)}</p>
