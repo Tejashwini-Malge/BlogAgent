@@ -29,6 +29,7 @@ consumed as if it were research data — leaving the caller no way to tell a
 successful search from a total outage. The model-facing text is unchanged;
 only the execution path now keeps what happened.
 """
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -344,6 +345,120 @@ def _ddgs_search(tool_name: str, query: str, full_query: str) -> ToolOutcome:
     return outcome
 
 
+WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
+# Wikipedia's API policy asks for a descriptive User-Agent that identifies the
+# client; the generic browser string the feed fetcher uses gets rate-limited
+# harder. Set WIKIPEDIA_CONTACT to an email/URL to comply fully.
+_WIKI_CONTACT = os.getenv("WIKIPEDIA_CONTACT", "").strip()
+_WIKI_HEADERS = {
+    "User-Agent": "BlogAgent/1.0 (automated research tool)"
+                  + (f" <{_WIKI_CONTACT}>" if _WIKI_CONTACT else "")
+}
+_WIKI_EXTRACT_LEN = 600
+# Wikipedia returns 429 readily on bursts. One retry clears the common case
+# without turning a throttled endpoint into a stalled pipeline stage.
+_WIKI_RETRIES = 2
+_WIKI_RETRY_DELAY = 1.5
+
+
+def _wikipedia_search(query: str) -> ToolOutcome:
+    """
+    Search Wikipedia and return intro extracts for the top matches.
+
+    One request: `generator=search` feeds the search hits straight into
+    `prop=extracts`, so titles, intro text and canonical URLs come back
+    together instead of needing a second round-trip per article.
+
+    Encyclopedic background only — deliberately NOT a news source. Wikipedia
+    lags announcements by days-to-weeks, so this grounds what a thing *is*,
+    not what just happened to it.
+    """
+    started = time.monotonic()
+    outcome = ToolOutcome(tool="search_wikipedia", query=query)
+    params = {
+        "action": "query",
+        "format": "json",
+        "generator": "search",
+        "gsrsearch": query,
+        "gsrlimit": _MAX_RESULTS,
+        "prop": "extracts|info",
+        "inprop": "url",
+        "exintro": 1,
+        "explaintext": 1,
+        "exlimit": _MAX_RESULTS,
+    }
+
+    payload, last_exc = None, None
+    for attempt in range(1, _WIKI_RETRIES + 1):
+        try:
+            response = requests.get(
+                WIKIPEDIA_API, params=params,
+                headers=_WIKI_HEADERS, timeout=_FEED_TIMEOUT,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            break
+        except Exception as exc:
+            last_exc = exc
+            throttled = getattr(getattr(exc, "response", None), "status_code", None) == 429
+            if attempt < _WIKI_RETRIES and throttled:
+                time.sleep(_WIKI_RETRY_DELAY)
+                continue
+            break
+
+    if payload is None:
+        outcome.status = STATUS_ERROR
+        outcome.error = str(last_exc)
+        outcome.text = f"Wikipedia search failed: {last_exc}"
+        outcome.elapsed_ms = int((time.monotonic() - started) * 1000)
+        return outcome
+
+    # No `query` key at all is how the API reports zero search hits — that's
+    # an empty result, not a malformed response.
+    pages = (payload.get("query") or {}).get("pages") or {}
+    if not pages:
+        outcome.status = STATUS_EMPTY
+        outcome.text = "No Wikipedia articles found for this query."
+        outcome.elapsed_ms = int((time.monotonic() - started) * 1000)
+        return outcome
+
+    # `pages` is a dict keyed by page id and arrives unordered; index carries
+    # the search ranking, so sort by it rather than trusting dict order.
+    ordered = sorted(pages.values(), key=lambda p: p.get("index", 0))
+
+    entity_tokens = _entity_tokens(query)
+    lines = []
+    for page in ordered:
+        title   = (page.get("title") or "").strip()
+        extract = _clean(page.get("extract") or "")
+        url     = page.get("fullurl") or ""
+        if not title or not extract:
+            continue
+        # Same hard gate as the feed and DDGS paths: a query naming a specific
+        # product must not be answered with an article about something else
+        # that merely shares its subject area.
+        if not _mentions_named_entity(entity_tokens, title, extract):
+            continue
+        outcome.results.append({"source": f"Wikipedia — {title}", "title": title, "url": url})
+        lines.append(
+            f"- {title}\n  {_truncate(extract[:_WIKI_EXTRACT_LEN])}\n  Source: {url}"
+        )
+
+    if not lines:
+        outcome.status = STATUS_EMPTY
+        outcome.text = (
+            "Wikipedia returned articles but none were about the specific "
+            "product/entity named in the query."
+        )
+        outcome.elapsed_ms = int((time.monotonic() - started) * 1000)
+        return outcome
+
+    outcome.status = STATUS_OK
+    outcome.text = "\n".join(lines)
+    outcome.elapsed_ms = int((time.monotonic() - started) * 1000)
+    return outcome
+
+
 def _impl_news(query: str) -> ToolOutcome:
     outcome = _fetch_entries("search_news", NEWS_FEEDS, query, _MAX_RESULTS)
     if outcome.status != STATUS_EMPTY:
@@ -362,6 +477,14 @@ def _impl_magazines(query: str) -> ToolOutcome:
 
 def _impl_blogs(query: str) -> ToolOutcome:
     return _fetch_entries("search_blogs", BLOG_FEEDS, query, _MAX_RESULTS)
+
+
+def _impl_wikipedia(query: str) -> ToolOutcome:
+    # No DDGS fallback here on purpose. The whole value of this tool is that a
+    # claim traces to an encyclopedia article; silently answering with a web
+    # search when Wikipedia has nothing would defeat that, and an empty result
+    # is itself useful signal ("this entity may not exist").
+    return _wikipedia_search(query)
 
 
 def _impl_real_world_example(query: str) -> ToolOutcome:
@@ -398,6 +521,16 @@ def search_blogs(query: str) -> str:
 
 
 @tool
+def search_wikipedia(query: str) -> str:
+    """Look up encyclopedic background on Wikipedia: what a technology,
+    company, person or concept actually is, when it appeared, and how it
+    relates to neighbouring things. Best for establishing definitions and
+    verifying that a named thing exists before writing about it. Not a news
+    source — it lags recent announcements. Input: a search query string."""
+    return _impl_wikipedia(query).text
+
+
+@tool
 def search_real_world_example(query: str) -> str:
     """Search the live web for a concrete real-world example, case study, or
     named company/product that illustrates the topic in practice. Input: a
@@ -406,12 +539,16 @@ def search_real_world_example(query: str) -> str:
 
 
 # Bound to the LLM for schema/function-calling. Unchanged.
-RESEARCH_TOOLS = [search_news, search_magazines, search_blogs, search_real_world_example]
+RESEARCH_TOOLS = [
+    search_news, search_magazines, search_blogs,
+    search_wikipedia, search_real_world_example,
+]
 
 # Used by the researcher to *execute* a chosen call and keep the structure.
 TOOL_IMPLS = {
     "search_news":               _impl_news,
     "search_magazines":          _impl_magazines,
     "search_blogs":              _impl_blogs,
+    "search_wikipedia":          _impl_wikipedia,
     "search_real_world_example": _impl_real_world_example,
 }

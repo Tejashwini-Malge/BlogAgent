@@ -1,5 +1,5 @@
 """
-Research phase: the model itself decides which of the four search tools
+Research phase: the model itself decides which of the five search tools
 (news, magazines, blogs, real-world example) are worth calling, and with
 what query — it isn't forced to call all four, and it can call none if it
 judges the topic doesn't need grounding. Capped at ONE decision round
@@ -61,10 +61,13 @@ _TOOL_DECISION_RETRIES = 2
 _SYSTEM = """\
 {backstory}
 
-You have four search tools: search_news, search_magazines, search_blogs, \
-and search_real_world_example. You get ONE round to call any of them (call \
-as many as are actually useful for this topic — you don't have to call all \
-four, and you don't have to call any if the topic doesn't need grounding). \
+You have five search tools: search_news, search_magazines, search_blogs, \
+search_wikipedia, and search_real_world_example. If the topic names a \
+specific technology, product, company or person, call search_wikipedia \
+first to establish what it actually is — then use the others for current \
+coverage. You get ONE round to call any of them (call as many as are \
+actually useful for this topic — you don't have to call all five, and you \
+don't have to call any if the topic doesn't need grounding). \
 After that you must write the final brief immediately using what you have. \
 Do not mention the tools or the search process in the brief itself, and \
 cite sources inline as (Source: <url>) where relevant.\
