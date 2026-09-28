@@ -82,6 +82,22 @@ Separate concern from grounding. Grounding asks *is this claim backed by a sourc
 - **Retry with backoff** — web search and Wikipedia both retry on any exception, not just a recognised 429. Scraped endpoints signal throttling as an opaque error with no status code to branch on, and a timeout is the failure that actually dominates on a flaky network. An honest zero-result search is never retried into a non-empty one.
 - **Pluggable web provider** — `SEARCH_PROVIDER=ddgs` (default, no key) scrapes DuckDuckGo; `brave` or `tavily` swap in a keyed API with a rate limit you can reason about. Name a provider without its key and the app falls back to DDGS **and records a degradation note** — it will not quietly hand you the scraper while you believe you configured Brave.
 
+#### What the run records actually showed
+
+Worth stating, because it contradicts the obvious guess. Over a 39-run baseline (`data/runs.jsonl`), 55 tool calls produced 30 `ok`, 14 `empty` and 11 `error` — and **all 11 errors were `Timeout`**. Zero DNS failures, zero 403s, zero 429s, zero rate limiting.
+
+The mechanism: `_FEED_TIMEOUT` is 8s per feed, and feeds were fetched *serially*, so five news feeds could take up to 40s — which does not fit inside the researcher's own `_TOOL_CALL_TIMEOUT` of 12s. Fourteen calls sat pinned at 11.6–12.3s before being killed. `search_news` carries the most feeds and was hit hardest: 13 `ok` against 12 `empty` and 8 `error`, with a median of 7155ms against a 12s ceiling.
+
+So the parallel fetch above is not a nice-to-have — it is the fix for the only failure this project has actually observed. A keyed search provider, which is what you would reach for against throttling, would have addressed none of those 11 errors; it addresses the 14 `empty` results, which are a *coverage* problem (curated feeds not carrying the topic), not a reliability one.
+
+To re-check on your own data:
+
+```bash
+python -c "import json,collections; c=collections.Counter((x.get('tool'),x.get('status')) for l in open('data/runs.jsonl',encoding='utf-8') if l.strip() for x in (json.loads(l).get('research') or {}).get('tool_calls') or []); [print(f'{t or chr(63):28s} {s or chr(63):7s} {n}') for (t,s),n in sorted(c.items())]"
+```
+
+If `error` counts stay near zero, the latency fix held. If `empty` dominates, coverage is the next thing worth money — set `SEARCH_PROVIDER` and a key.
+
 The honesty rule throughout: every tool result carries `STATUS_OK` / `STATUS_EMPTY` / `STATUS_ERROR`, and the distinction is load-bearing. Feeds falling back to web search fires only on `EMPTY` (a genuine miss), never on `ERROR` (an outage) — an outage must keep reading as "we don't know" rather than being papered over by a web search.
 
 
