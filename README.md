@@ -12,6 +12,7 @@ Sign up, type a topic, optionally pick a writing style, and watch three bounded 
 - **Real accounts** — email/password signup, session-based login, a profile page, and posts scoped to your own account (`GET /api/my-posts`).
 - **Live streaming UI** — agent activity and logs stream to the browser in real time via Server-Sent Events (SSE), authenticated by the same session cookie as the rest of the app.
 - **Research-grounding guardrails** — the pipeline actively defends against confident-sounding hallucination: it retries a search that returned results but ended up citing none of them, refuses to state unverified specifics even on well-cited runs, and rejects search results that don't actually mention the product/entity a topic names. See [Grounding guardrails](#grounding-guardrails).
+- **Search reliability layers** — the upstream sources are the least dependable part of the pipeline, so feed fetches run in parallel behind a TTL cache with a stale fallback (a feed that is down *right now* still counts if it answered within the hour), web search retries with backoff, and the web backend is pluggable — keyless DuckDuckGo by default, or a keyed API via `SEARCH_PROVIDER`. None of it invents data: an outage that outlasts the cache still reports as an outage, and a stale or degraded result is always recorded as such. See [Search reliability](#search-reliability).
 - **Customizable writing style** — tone, length, audience, and free-form notes, saved in the browser and injected into the agents' prompts.
 - **Daily scheduler** — drafts a topic from a queue at 8:30 IST, emails it for review, and publishes approved posts to LinkedIn (and hands you Medium-ready Markdown) at 9:00 IST.
 - **Review-by-email** — each draft gets its own unguessable, tokenized review link so you can approve/skip/revise from your phone without logging in.
@@ -38,20 +39,21 @@ Sign up, type a topic, optionally pick a writing style, and watch three bounded 
                                                                  ▼
      Researcher ────────────▶ Writer ────────────▶ Editor        (each phase → LLM via
   (tool-calling agent,     (bounded checks,      (skip-if-clean    OpenRouter, with a
-   picks its own sources)   1 bounded repair)      gate, 1 edit)   fallback model)
+   picks 0-5 of its own     1 bounded repair)      gate, 1 edit)   fallback model)
+   search tools)
                                                                  │
                                                                  ▼
                                                     output/<topic>.md  +  data/pending.json
                                                     (queued for review, tied to your account)
 ```
 
-Despite the name, **CrewAI's own execution engine (`Process.sequential`, `Task.context` chaining) is not actually used at runtime** — `src/agents.py` builds `crewai.Agent` objects only to reuse their `.backstory` text, and the real orchestration is hand-written in `src/services/workflow.py::run_crew()`. `src/crew.py` is now just a thin CLI entrypoint that imports `run_crew` — `python -m src.crew "topic"` still works exactly as before.
+**CrewAI is no longer a dependency.** It used to be, but its execution engine (`Process.sequential`, `Task.context` chaining) was never actually used at runtime — orchestration is hand-written in `src/services/workflow.py::run_crew()`, and the only thing ever read off a `crewai.Agent` was its `.backstory` string. Importing a whole agent framework to hold three strings was not free: crewai 0.51.0 runs telemetry at import, which hung `import app` outright and left two test files unable to run at all. Those three strings are now a plain `AgentProfile` dataclass in `src/agents.py`. `src/crew.py` remains a thin CLI entrypoint that imports `run_crew` — `python -m src.crew "topic"` works exactly as before.
 
 ### The three agents
 
 Each phase is a **bounded decision loop** — a small, explicit menu of actions with hard caps on how many it can take — not a single blind "write the whole thing" prompt.
 
-1. **Researcher** (`src/research_agent.py`) — the most literally agentic phase: the model itself picks which of four search tools to call (`search_news`, `search_magazines`, `search_blogs`, a live DuckDuckGo fallback), with what query, and how many (it can call none if it judges the topic doesn't need grounding). Capped at 2 rounds, and the second round only fires if the first came back empty **or** came back with results that ended up citing nothing — see [Grounding guardrails](#grounding-guardrails). Falls back to a single plain (toolless) pass if tool-calling itself isn't supported by the model/endpoint.
+1. **Researcher** (`src/research_agent.py`) — the most literally agentic phase: the model itself picks which of five search tools to call (`search_news`, `search_magazines`, `search_blogs`, `search_wikipedia`, `search_real_world_example`), with what query, and how many (it can call none if it judges the topic doesn't need grounding). Capped at 2 rounds, and the second round only fires if the first came back empty **or** came back with results that ended up citing nothing — see [Grounding guardrails](#grounding-guardrails). Falls back to a single plain (toolless) pass if tool-calling itself isn't supported by the model/endpoint.
 
 2. **Writer** (`src/writer_agent.py`) — drafts once from the research brief, then runs 5 named checks (`check_topic_coverage`, `check_length`, `check_structure`, `check_citations`, `check_style_and_voice`), and — if something's missing — takes exactly one bounded corrective action, verified afterward (a revision that drops a citation or doesn't measurably improve is rejected and the original draft kept). The writer only ever sees the research brief — it has no tools of its own and cannot go looking for its own sources.
 
@@ -71,6 +73,18 @@ Added after a real incident where a "grounded" post (real citations, real URLs) 
 
 ---
 
+### Search reliability
+
+Separate concern from grounding. Grounding asks *is this claim backed by a source*; this asks *did the search work at all today*. Four layers, all in `src/tools.py` and `src/search_providers.py`:
+
+- **TTL cache with a stale fallback** — feed bodies are cached for 10 minutes, and if a live fetch fails, a copy up to an hour old stands in rather than leaving a hole in the research. Past an hour a cached copy no longer honestly means "recent", so an outage reports as an outage.
+- **Parallel fetch** — feeds are fetched concurrently (~5x faster on a cold cache; worst case per tool drops from ~40s to ~8s). Only the network wait is parallel: parsing and ranking stay serial and in feed order, so output is deterministic regardless of which feed answers first. A per-URL lock means a cold cache does one request per feed, not one per waiting thread.
+- **Retry with backoff** — web search and Wikipedia both retry on any exception, not just a recognised 429. Scraped endpoints signal throttling as an opaque error with no status code to branch on, and a timeout is the failure that actually dominates on a flaky network. An honest zero-result search is never retried into a non-empty one.
+- **Pluggable web provider** — `SEARCH_PROVIDER=ddgs` (default, no key) scrapes DuckDuckGo; `brave` or `tavily` swap in a keyed API with a rate limit you can reason about. Name a provider without its key and the app falls back to DDGS **and records a degradation note** — it will not quietly hand you the scraper while you believe you configured Brave.
+
+The honesty rule throughout: every tool result carries `STATUS_OK` / `STATUS_EMPTY` / `STATUS_ERROR`, and the distinction is load-bearing. Feeds falling back to web search fires only on `EMPTY` (a genuine miss), never on `ERROR` (an outage) — an outage must keep reading as "we don't know" rather than being papered over by a web search.
+
+
 ## Project Structure
 
 ```
@@ -82,7 +96,7 @@ BlogAgent/
 │   ├── style.css               # Dark "typewriter" theme, animations, prose styling
 │   └── app.js                  # EventSource client, style persistence, DOMPurify-sanitized render
 ├── src/
-│   ├── agents.py               # LLM plumbing: primary/fallback model, usage tracking, crewai.Agent backstories
+│   ├── agents.py               # LLM plumbing: primary/fallback model, usage tracking, AgentProfile backstories
 │   ├── research_agent.py       # Researcher: tool-calling bounded loop
 │   ├── writer_agent.py         # Writer: draft + named checks + 1 bounded repair
 │   ├── editor_agent.py         # Editor: skip-if-clean gate + polish + hard safety gates
@@ -90,7 +104,9 @@ BlogAgent/
 │   ├── services/workflow.py    # run_crew() — the actual orchestration
 │   ├── crew.py                 # Thin CLI entrypoint (imports run_crew)
 │   ├── craft.py                # Deterministic prose/quality/grounding detectors + prompt contracts
-│   ├── tools.py                # Search tools (RSS feeds + DuckDuckGo) + named-entity relevance gate
+│   ├── tools.py                # 5 search tools (RSS + Wikipedia + web) + named-entity
+│   │                            # relevance gate + TTL cache + retry/backoff
+│   ├── search_providers.py     # Pluggable web search: ddgs (default, keyless), Brave, Tavily
 │   ├── citation_guard.py       # Strips/relabels citations not backed by a real retrieved URL
 │   ├── self_critic.py          # Optional metrics-delta self-critique loop (0-2 rounds, opt-in)
 │   ├── metrics.py               # Deterministic per-phase quality metrics
@@ -213,6 +229,7 @@ Passwords are hashed with `hashlib.pbkdf2_hmac` (stdlib, no extra dependency) be
 - **Review-email notifications go to one shared `NOTIFY_EMAIL`**, regardless of which account's post triggered them.
 - **State is JSON files + one SQLite database**, not a full relational store — fine for a single deploy, not built for concurrent write-heavy multi-tenant use.
 - **`/api/jobs/*` and `/api/posts*` are global and account-agnostic by design** — they're a service integration surface (API-key auth), not a per-user browser flow.
+- **`pending.json` is rewritten whole under a process-local lock** (`src/pending.py`). Safe for a single process; silently lossy if the app is ever run with more than one uvicorn worker, since two processes would each hold their own lock and last-write-wins. Deliberately deferred rather than overlooked — the fix is to move the post store into the existing SQLite database, which is worth doing at the same time as (and not before) deciding the multi-tenancy question above.
 
 This is an actively-evolving personal project, not a hardened multi-tenant product — some of the newer pieces (accounts, grounding guardrails) are genuinely a bit experimental. If something breaks, it breaks; treat it as an interesting orchestration to poke at, not a stable dependency.
 
@@ -223,7 +240,7 @@ This is an actively-evolving personal project, not a hardened multi-tenant produ
 - Python 3.11+
 - An OpenRouter (or other OpenAI-compatible) API key
 
-Dependencies (`requirements.txt`): `crewai`, `crewai-tools`, `langchain-openai`, `fastapi`, `uvicorn`, `sse-starlette`, `python-dotenv`, `apscheduler`, `requests`, `pydantic`, `ddgs`, `feedparser`. SQLite (accounts) and password hashing (`hashlib`) are Python stdlib — no extra dependency.
+Dependencies (`requirements.txt`): `langchain-openai`, `langchain-core`, `fastapi`, `uvicorn`, `sse-starlette`, `python-dotenv`, `python-multipart`, `apscheduler`, `requests`, `pydantic`, `ddgs`, `feedparser`. SQLite (accounts) and password hashing (`hashlib`) are Python stdlib — no extra dependency.
 
 ---
 
