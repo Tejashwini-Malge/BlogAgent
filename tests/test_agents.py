@@ -69,6 +69,9 @@ def test_empty_query_scores_zero():
 class _FakeResponse:
     content = b""
 
+    def raise_for_status(self):
+        return None
+
 
 def test_one_shared_word_is_not_enough_to_cite():
     """The failure the first eval batch found: "fear of starting in public"
