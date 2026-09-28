@@ -7,13 +7,15 @@ Run: python -m pytest tests/ -q
 """
 import json
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import runlog, tools
+from src import runlog, search_providers, tools
 from src.citation_guard import extract_cited_urls, strip_unverified_citations
 
 
@@ -102,6 +104,9 @@ def test_reason_distinguishes_errors_from_empty_matches():
 
 class _FakeResponse:
     content = b""
+
+    def raise_for_status(self):
+        return None
 
 
 def test_all_feeds_failing_is_error_not_empty(monkeypatch):
@@ -213,7 +218,7 @@ def _empty_feeds(monkeypatch):
 
 def test_news_falls_back_to_web_search_when_feeds_are_empty(monkeypatch):
     _empty_feeds(monkeypatch)
-    monkeypatch.setattr(tools, "DDGS", _FakeDDGS(results=[
+    monkeypatch.setattr(search_providers, "DDGS", _FakeDDGS(results=[
         {"title": "Layoffs surge in 2024", "body": "...", "url": "https://news.example.com/a"},
     ]))
 
@@ -225,7 +230,7 @@ def test_news_falls_back_to_web_search_when_feeds_are_empty(monkeypatch):
 
 def test_magazines_falls_back_to_web_search_when_feeds_are_empty(monkeypatch):
     _empty_feeds(monkeypatch)
-    monkeypatch.setattr(tools, "DDGS", _FakeDDGS(results=[
+    monkeypatch.setattr(search_providers, "DDGS", _FakeDDGS(results=[
         {"title": "Layoffs analysis", "body": "...", "url": "https://mag.example.com/a"},
     ]))
 
@@ -236,7 +241,7 @@ def test_magazines_falls_back_to_web_search_when_feeds_are_empty(monkeypatch):
 
 def test_news_stays_empty_when_fallback_also_finds_nothing(monkeypatch):
     _empty_feeds(monkeypatch)
-    monkeypatch.setattr(tools, "DDGS", _FakeDDGS(results=[]))
+    monkeypatch.setattr(search_providers, "DDGS", _FakeDDGS(results=[]))
 
     outcome = tools._impl_news("an extremely obscure query")
     assert outcome.status == tools.STATUS_EMPTY
@@ -249,7 +254,7 @@ def test_news_does_not_fall_back_on_feed_outage(monkeypatch):
     def boom(*a, **k):
         raise ConnectionError("dns failure")
     monkeypatch.setattr(tools.requests, "get", boom)
-    monkeypatch.setattr(tools, "DDGS", _FakeDDGS(results=[
+    monkeypatch.setattr(search_providers, "DDGS", _FakeDDGS(results=[
         {"title": "Should never be reached", "body": "", "url": "https://x.com/1"},
     ]))
 
@@ -381,3 +386,493 @@ def test_finalize_grounding_on_a_failed_run():
     record = _record("abc")
     grounding = runlog.finalize_grounding(record, "")
     assert grounding["level"] == runlog.UNGROUNDED
+
+
+# ── feed cache ────────────────────────────────────────────────────────────────
+
+def _matching_feed(monkeypatch, counter=None, response=None, error=None):
+    """Feeds that parse to one entry matching 'kubernetes operators'."""
+    def get(*a, **k):
+        if counter is not None:
+            counter.append(1)
+        if error is not None:
+            raise error
+        return response or _FakeResponse()
+    monkeypatch.setattr(tools.requests, "get", get)
+    monkeypatch.setattr(tools.feedparser, "parse", lambda _: type("P", (), {
+        "entries": [{"title": "Kubernetes operators explained",
+                     "summary": "operators", "link": "https://k8s.example.com/1"}],
+    })())
+
+
+def test_second_call_within_ttl_serves_from_cache(monkeypatch):
+    calls = []
+    _matching_feed(monkeypatch, counter=calls)
+
+    first  = tools._fetch_entries("search_news", tools.NEWS_FEEDS, "kubernetes operators", 5)
+    after_first = len(calls)
+    second = tools._fetch_entries("search_news", tools.NEWS_FEEDS, "kubernetes operators", 5)
+
+    assert first.status == tools.STATUS_OK
+    assert second.status == tools.STATUS_OK
+    assert second.urls == first.urls
+    # One request per feed, not two: the second run hit the cache throughout.
+    assert after_first == len(tools.NEWS_FEEDS)
+    assert len(calls) == after_first
+
+
+def test_stale_cache_covers_a_live_outage(monkeypatch):
+    """The whole point of the cache: a feed that is down *now* but answered a
+    few minutes ago still contributes, instead of leaving a hole."""
+    _matching_feed(monkeypatch)
+    primed = tools._fetch_entries("search_news", tools.NEWS_FEEDS, "kubernetes operators", 5)
+    assert primed.status == tools.STATUS_OK
+
+    # TTL of 0 forces a live fetch every time; the fetch then fails, so only the
+    # stale fallback can produce a result.
+    monkeypatch.setattr(tools, "_FEED_CACHE_TTL", 0)
+    _matching_feed(monkeypatch, error=ConnectionError("dns failure"))
+
+    outcome = tools._fetch_entries("search_news", tools.NEWS_FEEDS, "kubernetes operators", 5)
+    assert outcome.status == tools.STATUS_OK
+    assert outcome.urls == primed.urls
+    # Degraded, and the record says so rather than passing it off as fresh.
+    assert "cached copy" in outcome.error
+    assert "dns failure" in outcome.error
+
+
+def test_stale_note_is_not_reported_as_a_failed_feed(monkeypatch):
+    """A stale-served feed produced data, so it must not push the outcome to
+    STATUS_ERROR or print under 'All feeds failed to load'."""
+    _matching_feed(monkeypatch)
+    tools._fetch_entries("search_news", tools.NEWS_FEEDS, "kubernetes operators", 5)
+
+    monkeypatch.setattr(tools, "_FEED_CACHE_TTL", 0)
+    _matching_feed(monkeypatch, error=ConnectionError("dns failure"))
+
+    outcome = tools._fetch_entries("search_news", tools.NEWS_FEEDS, "kubernetes operators", 5)
+    assert outcome.status != tools.STATUS_ERROR
+    assert not outcome.text.startswith("All feeds failed to load")
+
+
+def test_cache_expires_past_the_stale_ceiling(monkeypatch):
+    """Past _FEED_STALE_MAX a cached copy no longer honestly means 'recent',
+    so an outage has to read as an outage."""
+    _matching_feed(monkeypatch)
+    tools._fetch_entries("search_news", tools.NEWS_FEEDS, "kubernetes operators", 5)
+
+    monkeypatch.setattr(tools, "_FEED_CACHE_TTL", 0)
+    monkeypatch.setattr(tools, "_FEED_STALE_MAX", 0)
+    _matching_feed(monkeypatch, error=ConnectionError("dns failure"))
+
+    outcome = tools._fetch_entries("search_news", tools.NEWS_FEEDS, "kubernetes operators", 5)
+    assert outcome.status == tools.STATUS_ERROR
+    assert outcome.results == []
+
+
+def test_http_error_status_is_an_outage_not_an_empty_feed(monkeypatch):
+    """A 403 error page parses to zero entries. Without raise_for_status that
+    reads as 'no news', and the cache would pin it for the whole TTL."""
+    class _Forbidden:
+        content = b"<html>403 Forbidden</html>"
+        def raise_for_status(self):
+            raise RuntimeError("403 Client Error: Forbidden")
+
+    _matching_feed(monkeypatch, response=_Forbidden())
+
+    outcome = tools._fetch_entries("search_news", tools.NEWS_FEEDS, "kubernetes operators", 5)
+    assert outcome.status == tools.STATUS_ERROR
+    assert "403" in outcome.error
+
+
+# ── web search retry (provider-agnostic) ────────────────────────────────────────────────────────────────
+
+class _FlakyDDGS:
+    """Raises on the first `fail_times` calls, then returns `results`."""
+    def __init__(self, fail_times, results):
+        self.fail_times = fail_times
+        self.results = results
+        self.attempts = 0
+
+    def __call__(self, *a, **k):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def text(self, query, max_results=5):
+        self.attempts += 1
+        if self.attempts <= self.fail_times:
+            raise RuntimeError("ratelimit")
+        return self.results
+
+
+def test_web_search_retries_a_transient_throttle(monkeypatch):
+    monkeypatch.setattr(tools, "_DDGS_RETRY_BASE_DELAY", 0)
+    flaky = _FlakyDDGS(fail_times=2, results=[
+        {"title": "Layoffs surge in 2024", "body": "...", "url": "https://news.example.com/a"},
+    ])
+    monkeypatch.setattr(search_providers, "DDGS", flaky)
+
+    outcome = tools._web_search("search_real_world_example", "layoffs 2024", "layoffs 2024")
+    assert outcome.status == tools.STATUS_OK
+    assert flaky.attempts == 3
+    assert outcome.urls == ["https://news.example.com/a"]
+
+
+def test_web_search_gives_up_after_the_retry_budget(monkeypatch):
+    monkeypatch.setattr(tools, "_DDGS_RETRY_BASE_DELAY", 0)
+    flaky = _FlakyDDGS(fail_times=99, results=[])
+    monkeypatch.setattr(search_providers, "DDGS", flaky)
+
+    outcome = tools._web_search("search_real_world_example", "layoffs 2024", "layoffs 2024")
+    assert outcome.status == tools.STATUS_ERROR
+    assert flaky.attempts == tools._DDGS_RETRIES
+    assert "ratelimit" in outcome.error
+
+
+def test_web_search_does_not_retry_an_honest_empty_result(monkeypatch):
+    """Zero results is an answer, not a failure — retrying it just burns the
+    rate limit that keeps the real searches working."""
+    monkeypatch.setattr(tools, "_DDGS_RETRY_BASE_DELAY", 0)
+    flaky = _FlakyDDGS(fail_times=0, results=[])
+    monkeypatch.setattr(search_providers, "DDGS", flaky)
+
+    outcome = tools._web_search("search_real_world_example", "obscure", "obscure")
+    assert outcome.status == tools.STATUS_EMPTY
+    assert flaky.attempts == 1
+
+
+# ── shared retry helper ───────────────────────────────────────────────────────
+
+def test_with_retries_returns_first_success_without_sleeping():
+    calls = []
+    value, exc = tools._with_retries(lambda: calls.append(1) or "ok", 3, 0)
+    assert value == "ok"
+    assert exc is None
+    assert len(calls) == 1
+
+
+def test_with_retries_gives_up_and_returns_last_exception():
+    def boom():
+        raise RuntimeError("nope")
+    value, exc = tools._with_retries(boom, 3, 0)
+    assert value is None
+    assert "nope" in str(exc)
+
+
+def test_with_retries_honours_a_should_retry_predicate():
+    """A predicate that rejects the exception must stop after one attempt."""
+    calls = []
+
+    def boom():
+        calls.append(1)
+        raise RuntimeError("permanent")
+
+    value, exc = tools._with_retries(boom, 3, 0, should_retry=lambda e: False)
+    assert value is None
+    assert len(calls) == 1
+
+
+# ── wikipedia retry, widened past 429-only ────────────────────────────────────
+
+def test_wikipedia_retries_a_timeout_not_just_a_429(monkeypatch):
+    """The old loop only retried a recognised 429, so a timeout — the failure
+    that actually dominates on a flaky network — died on the first attempt."""
+    monkeypatch.setattr(tools, "_WIKI_RETRY_DELAY", 0)
+    calls = []
+
+    def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) < 3:
+            raise TimeoutError("read timed out")
+        return _FakeWikiResponse({
+            "query": {"pages": {"1": {
+                "index": 1, "title": "Kubernetes",
+                "extract": "Kubernetes is an orchestration system.",
+                "fullurl": "https://en.wikipedia.org/wiki/Kubernetes",
+            }}}
+        })
+
+    monkeypatch.setattr(tools.requests, "get", flaky)
+
+    outcome = tools._wikipedia_search("Kubernetes")
+    assert outcome.status == tools.STATUS_OK
+    assert len(calls) == 3
+    assert outcome.urls == ["https://en.wikipedia.org/wiki/Kubernetes"]
+
+
+class _FakeWikiResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+def test_wikipedia_gives_up_after_the_retry_budget(monkeypatch):
+    monkeypatch.setattr(tools, "_WIKI_RETRY_DELAY", 0)
+    calls = []
+
+    def always_fails(*a, **k):
+        calls.append(1)
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(tools.requests, "get", always_fails)
+
+    outcome = tools._wikipedia_search("Kubernetes")
+    assert outcome.status == tools.STATUS_ERROR
+    assert len(calls) == tools._WIKI_RETRIES
+
+
+def test_wikipedia_empty_result_is_not_retried(monkeypatch):
+    """Zero articles is an answer ('this entity may not exist'), not a failure."""
+    calls = []
+
+    def empty(*a, **k):
+        calls.append(1)
+        return _FakeWikiResponse({})
+
+    monkeypatch.setattr(tools.requests, "get", empty)
+
+    outcome = tools._wikipedia_search("a thing that does not exist")
+    assert outcome.status == tools.STATUS_EMPTY
+    assert len(calls) == 1
+
+
+# ── blogs fallback parity ─────────────────────────────────────────────────────
+
+def test_blogs_falls_back_to_web_search_when_feeds_are_empty(monkeypatch):
+    """search_blogs was the only feed tool with nowhere to go on an empty
+    result, despite having the narrowest source set of the three."""
+    _empty_feeds(monkeypatch)
+    monkeypatch.setattr(search_providers, "DDGS", _FakeDDGS(results=[
+        {"title": "Layoffs, a field report", "body": "...", "url": "https://blog.example.com/a"},
+    ]))
+
+    outcome = tools._impl_blogs("rise of layoffs 2024")
+    assert outcome.status == tools.STATUS_OK
+    assert outcome.tool == "search_blogs"      # attributed to the tool, not the fallback
+    assert outcome.urls == ["https://blog.example.com/a"]
+
+
+def test_blogs_does_not_fall_back_on_feed_outage(monkeypatch):
+    """Same rule as news/magazines: an outage stays an outage."""
+    def boom(*a, **k):
+        raise ConnectionError("dns failure")
+    monkeypatch.setattr(tools.requests, "get", boom)
+    monkeypatch.setattr(search_providers, "DDGS", _FakeDDGS(results=[
+        {"title": "Should never be reached", "body": "", "url": "https://x.com/1"},
+    ]))
+
+    outcome = tools._impl_blogs("kubernetes operators")
+    assert outcome.status == tools.STATUS_ERROR
+    assert outcome.results == []
+
+
+# ── parallel feed fetch ───────────────────────────────────────────────────────
+
+def test_parallel_fetch_keeps_output_order_deterministic(monkeypatch):
+    """Parsing stays in feed order, so equal-scoring entries rank identically
+    every run. Serial code got this for free; parallel code must not lose it."""
+    import random
+
+    def get(url, *a, **k):
+        # Random latency so completion order differs from submission order.
+        time.sleep(random.uniform(0, 0.02))
+        return _FakeResponse()
+
+    monkeypatch.setattr(tools.requests, "get", get)
+
+    # Every feed yields an entry with the SAME score, so only iteration order
+    # can decide the ranking.
+    counter = {"n": 0}
+
+    def parse(_):
+        counter["n"] += 1
+        n = counter["n"]
+        return type("P", (), {"entries": [
+            {"title": "Kubernetes operators explained",
+             "summary": "operators", "link": f"https://feed{n}.example.com/1"},
+        ]})()
+
+    monkeypatch.setattr(tools.feedparser, "parse", parse)
+
+    runs = []
+    for _ in range(3):
+        tools.clear_feed_cache()
+        counter["n"] = 0
+        out = tools._fetch_entries("search_news", tools.NEWS_FEEDS, "kubernetes operators", 5)
+        assert out.status == tools.STATUS_OK
+        runs.append(out.urls)
+
+    assert runs[0] == runs[1] == runs[2], f"ordering drifted across runs: {runs}"
+
+
+def test_concurrent_fetch_of_one_url_makes_a_single_request(monkeypatch):
+    """Cold cache + parallel fetch used to mean one request per waiting thread.
+    The per-URL in-flight lock collapses that to one request total."""
+    calls = []
+    lock = threading.Lock()
+
+    def slow_get(url, *a, **k):
+        with lock:
+            calls.append(url)
+        time.sleep(0.15)          # long enough for the others to pile up behind
+        return _FakeResponse()
+
+    monkeypatch.setattr(tools.requests, "get", slow_get)
+
+    url = "https://one.example.com/feed"
+    results = []
+
+    def worker():
+        results.append(tools._fetch_feed_bytes(url))
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(calls) == 1, f"stampede: {len(calls)} requests for one URL"
+    assert len(results) == 6
+    assert all(content is not None for content, _ in results)
+
+
+def test_out_of_order_failures_still_split_errors_from_notes(monkeypatch):
+    """Completion order is nondeterministic now, so the errors/notes split has
+    to be driven by per-feed outcome, not by arrival sequence."""
+    failing = tools.NEWS_FEEDS[1][1]
+
+    def get(url, *a, **k):
+        # The failing feed answers fastest, so it lands first regardless of rank.
+        if url == failing:
+            raise ConnectionError("dns failure")
+        time.sleep(0.02)
+        return _FakeResponse()
+
+    monkeypatch.setattr(tools.requests, "get", get)
+    monkeypatch.setattr(tools.feedparser, "parse", lambda _: type("P", (), {
+        "entries": [{"title": "Kubernetes operators explained",
+                     "summary": "operators", "link": "https://k8s.example.com/1"}],
+    })())
+
+    outcome = tools._fetch_entries("search_news", tools.NEWS_FEEDS, "kubernetes operators", 5)
+
+    # Other feeds succeeded, so this is a partial failure, not an outage.
+    assert outcome.status == tools.STATUS_OK
+    assert "dns failure" in outcome.error
+    assert not outcome.text.startswith("All feeds failed to load")
+
+
+# ── search provider selection ─────────────────────────────────────────────────
+
+def test_default_provider_is_keyless_ddgs(monkeypatch):
+    """A fresh clone with no .env must still search."""
+    provider, note = search_providers.get_provider()
+    assert provider.name == "ddgs"
+    assert note is None
+
+
+def test_keyed_provider_is_used_when_its_key_is_present(monkeypatch):
+    monkeypatch.setenv("SEARCH_PROVIDER", "brave")
+    monkeypatch.setenv("BRAVE_API_KEY", "test-key-not-real")
+
+    provider, note = search_providers.get_provider()
+    assert provider.name == "brave"
+    assert note is None
+
+
+def test_missing_key_degrades_to_ddgs_with_a_note_not_silently(monkeypatch):
+    """The whole point of the note: someone who believed they configured Brave
+    must not get the scraper handed to them quietly — that hides the exact
+    failure they were paying to avoid."""
+    monkeypatch.setenv("SEARCH_PROVIDER", "brave")
+    monkeypatch.delenv("BRAVE_API_KEY", raising=False)
+
+    provider, note = search_providers.get_provider()
+    assert provider.name == "ddgs"
+    assert "BRAVE_API_KEY" in note
+    assert "unset" in note
+
+
+def test_unknown_provider_name_degrades_with_a_note(monkeypatch):
+    monkeypatch.setenv("SEARCH_PROVIDER", "altavista")
+
+    provider, note = search_providers.get_provider()
+    assert provider.name == "ddgs"
+    assert "altavista" in note
+
+
+def test_degradation_note_reaches_the_tool_outcome(monkeypatch):
+    """A note that never leaves get_provider() would be useless — it has to land
+    on the record the operator actually reads."""
+    monkeypatch.setenv("SEARCH_PROVIDER", "tavily")
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setattr(search_providers, "DDGS", _FakeDDGS(results=[
+        {"title": "A result", "body": "...", "url": "https://x.example.com/1"},
+    ]))
+
+    outcome = tools._web_search("search_real_world_example", "anything", "anything")
+    assert outcome.status == tools.STATUS_OK          # still worked
+    assert "TAVILY_API_KEY" in outcome.error          # but said it was degraded
+
+
+# ── provider result normalisation ─────────────────────────────────────────────
+
+class _FakeHTTPResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+def test_brave_results_normalise_to_the_shared_shape(monkeypatch):
+    """Brave calls the snippet 'description'; tools.py only knows 'body'."""
+    monkeypatch.setattr(search_providers.requests, "get", lambda *a, **k: _FakeHTTPResponse({
+        "web": {"results": [
+            {"title": "Kubernetes operators", "description": "A pattern for…",
+             "url": "https://brave.example.com/1"},
+        ]}
+    }))
+
+    rows = search_providers.BraveProvider("key").search("kubernetes operators", 5)
+    assert rows == [{"title": "Kubernetes operators", "body": "A pattern for…",
+                     "url": "https://brave.example.com/1"}]
+
+
+def test_tavily_results_normalise_to_the_shared_shape(monkeypatch):
+    """Tavily calls the snippet 'content'."""
+    monkeypatch.setattr(search_providers.requests, "post", lambda *a, **k: _FakeHTTPResponse({
+        "results": [
+            {"title": "Operators in practice", "content": "A longer extract…",
+             "url": "https://tavily.example.com/1"},
+        ]
+    }))
+
+    rows = search_providers.TavilyProvider("key").search("kubernetes operators", 5)
+    assert rows == [{"title": "Operators in practice", "body": "A longer extract…",
+                     "url": "https://tavily.example.com/1"}]
+
+
+def test_keyed_provider_respects_max_results(monkeypatch):
+    monkeypatch.setattr(search_providers.requests, "get", lambda *a, **k: _FakeHTTPResponse({
+        "web": {"results": [
+            {"title": f"r{i}", "description": "d", "url": f"https://b.example.com/{i}"}
+            for i in range(10)
+        ]}
+    }))
+
+    rows = search_providers.BraveProvider("key").search("q", 3)
+    assert len(rows) == 3

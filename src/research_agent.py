@@ -1,7 +1,7 @@
 """
 Research phase: the model itself decides which of the five search tools
 (news, magazines, blogs, real-world example) are worth calling, and with
-what query — it isn't forced to call all four, and it can call none if it
+what query — it isn't forced to call all five, and it can call none if it
 judges the topic doesn't need grounding. Capped at ONE decision round
 (MAX_TOOL_ITERS) so it can't loop indefinitely re-querying and burning
 tokens on repeated LLM round-trips; after that round it must answer using

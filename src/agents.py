@@ -2,8 +2,8 @@ import os
 import re
 import threading
 import time
+from dataclasses import dataclass
 from dotenv import load_dotenv
-from crewai import Agent
 from langchain_openai import ChatOpenAI
 
 from src.tools import RESEARCH_TOOLS
@@ -254,7 +254,28 @@ smart_llm = FallbackLLM(llm, _fallback_llm)
 # search tools to call (and with what query), capped to one decision round.
 research_llm = smart_llm.bind_tools(RESEARCH_TOOLS)
 
-researcher = Agent(
+# ── Phase profiles ────────────────────────────────────────────────────────────
+# These were `crewai.Agent` objects. CrewAI's execution engine was never used at
+# runtime — orchestration is hand-written in services/workflow.py — and the only
+# field ever read off them is `.backstory` (workflow.py:173, :251, :325). Every
+# other field (`llm`, `tools`, `verbose`, `allow_delegation`) was inert.
+#
+# Importing crewai to hold three strings was not free: crewai 0.51.0 runs
+# telemetry at import, which hung `from src import agents` indefinitely. That
+# blocked `import app` outright and left tests/test_topic_queue.py and
+# tests/test_usage.py unable to run at all.
+#
+# `role` and `goal` stay deliberately. They are inert today, but they document
+# what each phase is for and are the text to edit if these ever get reconnected
+# to a real agent framework.
+@dataclass(frozen=True)
+class AgentProfile:
+    role: str
+    goal: str
+    backstory: str
+
+
+researcher = AgentProfile(
     role="Senior Research Analyst",
     goal=(
         "Produce a thorough, well-structured research brief on the given topic. "
@@ -264,13 +285,9 @@ researcher = Agent(
         "You are a meticulous researcher with 15 years of experience summarising "
         "complex topics for non-expert audiences. You never fabricate facts."
     ),
-    llm=llm,
-    tools=RESEARCH_TOOLS,
-    verbose=True,
-    allow_delegation=False,
 )
 
-writer = Agent(
+writer = AgentProfile(
     role="Expert Technical Writer",
     goal=(
         "Transform a research brief into an engaging, 500-800 word blog post "
@@ -280,12 +297,9 @@ writer = Agent(
         "You write for a tech-savvy but non-specialist audience. "
         "Your prose is clear, conversational, and avoids unnecessary jargon."
     ),
-    llm=llm,
-    verbose=True,
-    allow_delegation=False,
 )
 
-editor = Agent(
+editor = AgentProfile(
     role="Chief Editor",
     goal=(
         "Review and polish the blog post draft. Fix grammar, improve flow, "
@@ -295,7 +309,4 @@ editor = Agent(
         "You have edited thousands of tech blog posts. You are direct, precise, "
         "and care deeply about the reader's experience."
     ),
-    llm=llm,
-    verbose=True,
-    allow_delegation=False,
 )

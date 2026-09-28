@@ -1,7 +1,8 @@
-crewai==0.51.0
-crewai-tools==0.17.0
 python-dotenv==1.0.1
 langchain-openai>=0.1.0
+# src/tools.py imports langchain_core.tools.tool directly; declared explicitly
+# rather than relied on transitively now that crewai is gone.
+langchain-core>=0.2.0
 fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 python-multipart>=0.0.9
